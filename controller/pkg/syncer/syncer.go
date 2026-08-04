@@ -449,7 +449,9 @@ func (s *Syncer) buildAgwResources(
 	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
 
 	// Build routes
-	var routeParents translator.ParentResolver = translator.BuildRouteParents(filteredGateways)
+	waypointServices := BuildWaypointServiceBindings(s.agwCollections.Services, s.agwCollections.Namespaces, filteredGateways, krtopts)
+
+	var routeParents translator.ParentResolver = translator.BuildRouteParents(filteredGateways, waypointServices, s.agwCollections.Services)
 
 	// Compose with plugin-provided parent resolvers.
 	if ext := s.agwPlugins.AddResourceExtension; ext != nil && len(ext.ParentResolvers) > 0 {
@@ -732,11 +734,29 @@ func (s *Syncer) getBindProtocol(obj *translator.GatewayListener) api.Bind_Proto
 }
 
 // getTunnelProtocol maps a Gateway listener protocol to its tunnel protocol.
-// HBONE listeners use HBONE_GATEWAY mode: the proxy terminates inbound HBONE
-// and routes CONNECT requests to local binds.
+//
+// Both HBONE modes terminate the inbound HBONE mTLS tunnel (accept the peer's
+// workload cert, decrypt, and serve the inner CONNECT). They differ only in how
+// the CONNECT target is resolved and routed:
+//
+//   - HBONE_WAYPOINT: the proxy is acting as an ambient-mesh waypoint. The CONNECT
+//     target is resolved via service discovery and the *original* destination is
+//     preserved, so mesh policy is applied to the intended service. Selected when
+//     the parent Gateway is a mesh waypoint (gateway.istio.io/managed=istio.io-mesh-controller).
+//   - HBONE_GATEWAY: the proxy is acting as a plain HBONE ingress. The terminated
+//     CONNECT is routed to the gateway's own local binds/listeners rather than to
+//     the original ambient destination. Selected for a normal (non-waypoint) HBONE
+//     Gateway listener.
+//
+// In short: waypoint mode preserves the original destination; gateway mode re-enters
+// the local bind pipeline. This is why the distinction keys off ParentInfo.Waypoint
+// rather than TLS passthrough.
 func (s *Syncer) getTunnelProtocol(obj *translator.GatewayListener) api.Bind_TunnelProtocol {
 	switch obj.ParentInfo.Protocol {
 	case gwv1.ProtocolType(protocol.HBONE):
+		if obj.ParentInfo.Waypoint {
+			return api.Bind_HBONE_WAYPOINT
+		}
 		return api.Bind_HBONE_GATEWAY
 	default:
 		return api.Bind_DIRECT
@@ -769,6 +789,7 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 	}
 
 	waypoints := builder.WaypointsCollection(clusterId, cols.Gateways, cols.GatewayClasses, cols.Pods, opts)
+	serviceEntryVisibility := model.ServiceEntryVisibilityCollection(meshConfig.AsCollection(), opts)
 	services := builder.ServicesCollection(
 		clusterId,
 		cols.Services,
@@ -776,6 +797,7 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		waypoints,
 		cols.Namespaces,
 		meshConfig,
+		serviceEntryVisibility,
 		opts,
 		true,
 	)
