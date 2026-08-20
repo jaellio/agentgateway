@@ -4,6 +4,11 @@ const (
 	// DefaultAgwClassName is the GatewayClass name for the agentgateway proxy.
 	DefaultAgwClassName = "agentgateway"
 
+	// AgentgatewayWaypointClassName is the GatewayClass name for agentgateway
+	// waypoints. Gateways using this class are treated as ambient waypoint
+	// parents for service binding and HBONE waypoint tunneling.
+	AgentgatewayWaypointClassName = "agentgateway-waypoint"
+
 	// DefaultAgwControllerName is the name of the agentgateway controller that has implemented the Gateway API
 	// It is configured to manage GatewayClasses with the name DefaultAgwClassName
 	DefaultAgwControllerName = "agentgateway.dev/agentgateway"

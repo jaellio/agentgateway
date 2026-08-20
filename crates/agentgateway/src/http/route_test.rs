@@ -1235,6 +1235,13 @@ fn svc_nh() -> NamespacedHostname {
 	}
 }
 
+fn svc_nh_short() -> NamespacedHostname {
+	NamespacedHostname {
+		namespace: strng::new("default"),
+		hostname: strng::new("my-app"),
+	}
+}
+
 fn waypoint_svc() -> Service {
 	make_service(
 		"my-app",
@@ -1301,6 +1308,29 @@ async fn test_service_route_path_match() {
 	attach_waypoint_service(&mut req, &stores, &svc_nh());
 	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
 	assert_eq!(result.unwrap().0.key.as_str(), "health-route");
+}
+
+#[tokio::test]
+async fn test_service_route_short_service_key_matches_waypoint_fqdn() {
+	let stores = stores_with_service_routes(
+		waypoint_svc(),
+		vec![service_route(
+			"short-key-route",
+			svc_nh_short(),
+			prefix_match("/header-demo"),
+		)],
+	);
+	let listener = hbone_listener();
+	let dst = SocketAddr::new("10.0.0.100".parse().unwrap(), 80);
+
+	let mut req = request(
+		"http://my-app.default.svc.cluster.local/header-demo",
+		http::Method::GET,
+		&[],
+	);
+	attach_waypoint_service(&mut req, &stores, &svc_nh());
+	let result = super::select_best_route(stores.clone(), dst, &listener, &req);
+	assert_eq!(result.unwrap().0.key.as_str(), "short-key-route");
 }
 
 #[tokio::test]

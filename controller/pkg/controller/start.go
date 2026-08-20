@@ -299,6 +299,18 @@ func GetDefaultClassInfo(
 		SupportedFeatures: deployer.GetSupportedFeaturesForAgentGateway(),
 	}
 	applyGatewayClassParametersRef(classInfos[agwClassName], agwClassName, refOverrides)
+
+	if _, exists := classInfos[wellknown.AgentgatewayWaypointClassName]; !exists {
+		classInfos[wellknown.AgentgatewayWaypointClassName] = &deployer.GatewayClassInfo{
+			Description:       "Waypoint class for ambient routing in agentgateway.",
+			Labels:            map[string]string{},
+			Annotations:       map[string]string{},
+			ControllerName:    agwControllerName,
+			SupportedFeatures: deployer.GetSupportedFeaturesForAgentGateway(),
+		}
+		applyGatewayClassParametersRef(classInfos[wellknown.AgentgatewayWaypointClassName], wellknown.AgentgatewayWaypointClassName, refOverrides)
+	}
+
 	maps.Copy(classInfos, additionalClassInfos)
 	for name, info := range additionalClassInfos {
 		applyGatewayClassParametersRef(info, name, refOverrides)

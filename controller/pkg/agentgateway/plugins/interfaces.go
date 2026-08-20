@@ -106,9 +106,9 @@ type ParentInfo struct {
 	// annotation on the listener's parent Gateway or ListenerSet.
 	Internal bool
 
-	// Waypoint marks this listener's parent Gateway as an ambient mesh waypoint
-	// (labeled gateway.istio.io/managed=istio.io-mesh-controller). HBONE listeners on a
-	// waypoint use the HBONE_WAYPOINT tunnel protocol (preserving the original destination)
+	// Waypoint marks this listener's parent Gateway as an agentgateway waypoint
+	// (GatewayClass=agentgateway-waypoint). HBONE listeners on a waypoint use
+	// the HBONE_WAYPOINT tunnel protocol (preserving the original destination)
 	// instead of HBONE_GATEWAY.
 	Waypoint bool
 }

@@ -165,8 +165,22 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 
 	gatewayInitialStatus, gateways := s.buildGatewayCollection(gatewayClasses, listenerSets, refGrants, krtopts)
 
+	// Build address collections first so route-parent service bindings can be
+	// derived from ambient-resolved ServiceInfo instead of re-parsing labels.
+	addressBuilder := s.buildAddressCollectionsFunc
+	if addressBuilder == nil {
+		addressBuilder = defaultBuildAddressCollections
+	}
+	addresses, hasSynced := addressBuilder(s.agwCollections, krtopts)
+	serviceInfos := krt.NewCollection(addresses, func(ctx krt.HandlerContext, a Address) *model.ServiceInfo {
+		if a.Service == nil {
+			return nil
+		}
+		return a.Service
+	}, krtopts.ToOptions("addresses/ServiceInfos")...)
+
 	// Build Agw resources for gateway
-	agwResources, routeAttachments, ancestorCollection := s.buildAgwResources(gateways, listenerSets, refGrants, referenceTypes, krtopts)
+	agwResources, routeAttachments, ancestorCollection := s.buildAgwResources(gateways, listenerSets, refGrants, referenceTypes, serviceInfos, krtopts)
 
 	gatewayFinalStatus := s.buildFinalGatewayStatus(gatewayInitialStatus, routeAttachments, krtopts)
 	status.RegisterStatus(s.statusCollections, gatewayFinalStatus, translator.GetStatus)
@@ -182,13 +196,6 @@ func (s *Syncer) buildResourceCollections(krtopts krtutil.KrtOptions) {
 
 	listenerSetFinalStatus := s.buildFinalListenerSetStatus(gateways, listenerSetInitialStatus, routeAttachments, krtopts)
 	status.RegisterStatus(s.statusCollections, listenerSetFinalStatus, translator.GetStatus)
-
-	// Build address collections
-	addressBuilder := s.buildAddressCollectionsFunc
-	if addressBuilder == nil {
-		addressBuilder = defaultBuildAddressCollections
-	}
-	addresses, hasSynced := addressBuilder(s.agwCollections, krtopts)
 
 	// Build XDS collection
 	s.buildXDSCollection(agwResources, addresses, krtopts)
@@ -413,6 +420,7 @@ func (s *Syncer) buildAgwResources(
 	listenerSets krt.Collection[translator.ListenerSet],
 	refGrants translator.ReferenceGrants,
 	referenceTypes plugins.ReferenceTypes,
+	serviceInfos krt.Collection[model.ServiceInfo],
 	krtopts krtutil.KrtOptions,
 ) (krt.Collection[agwir.AgwResource], krt.Collection[*plugins.RouteAttachment], plugins.ReferenceIndex) {
 	// filter gateway collections to only include gateways which use a built-in gateway class
@@ -449,7 +457,7 @@ func (s *Syncer) buildAgwResources(
 	listeners := krt.JoinCollection(listenerCollections, krtopts.ToOptions("resources/Listeners")...)
 
 	// Build routes
-	waypointServices := BuildWaypointServiceBindings(s.agwCollections.Services, s.agwCollections.Namespaces, filteredGateways, krtopts)
+	waypointServices := BuildWaypointServiceBindings(serviceInfos, filteredGateways, krtopts)
 
 	var routeParents translator.ParentResolver = translator.BuildRouteParents(filteredGateways, waypointServices, s.agwCollections.Services)
 
@@ -742,7 +750,7 @@ func (s *Syncer) getBindProtocol(obj *translator.GatewayListener) api.Bind_Proto
 //   - HBONE_WAYPOINT: the proxy is acting as an ambient-mesh waypoint. The CONNECT
 //     target is resolved via service discovery and the *original* destination is
 //     preserved, so mesh policy is applied to the intended service. Selected when
-//     the parent Gateway is a mesh waypoint (gateway.istio.io/managed=istio.io-mesh-controller).
+//     the parent Gateway uses the agentgateway-waypoint GatewayClass.
 //   - HBONE_GATEWAY: the proxy is acting as a plain HBONE ingress. The terminated
 //     CONNECT is routed to the gateway's own local binds/listeners rather than to
 //     the original ambient destination. Selected for a normal (non-waypoint) HBONE
@@ -789,7 +797,6 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 	}
 
 	waypoints := builder.WaypointsCollection(clusterId, cols.Gateways, cols.GatewayClasses, cols.Pods, opts)
-	serviceEntryVisibility := model.ServiceEntryVisibilityCollection(meshConfig.AsCollection(), opts)
 	services := builder.ServicesCollection(
 		clusterId,
 		cols.Services,
@@ -797,7 +804,6 @@ func defaultBuildAddressCollections(cols *plugins.AgwCollections, krtopts krtuti
 		waypoints,
 		cols.Namespaces,
 		meshConfig,
-		serviceEntryVisibility,
 		opts,
 		true,
 	)

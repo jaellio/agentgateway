@@ -320,7 +320,7 @@ func GatewayTransformationFunc(cfg GatewayCollectionConfig) func(ctx krt.Handler
 				Protocol:               l.Protocol,
 				TLSPassthrough:         l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
 				Internal:               internalPorts.Has(l.Port),
-				Waypoint:               string(obj.Spec.GatewayClassName) == constants.AgentgatewayRemoteWaypointClassName,
+				Waypoint:               string(obj.Spec.GatewayClassName) == wellknown.AgentgatewayWaypointClassName,
 			}
 
 			res := &GatewayListener{
@@ -589,7 +589,7 @@ func ListenerSetBuilder(
 			Protocol:         l.Protocol,
 			TLSPassthrough:   l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
 			Internal:         internalPorts.Has(l.Port),
-			Waypoint:         string(parentGwObj.Spec.GatewayClassName) == constants.AgentgatewayRemoteWaypointClassName,
+			Waypoint:         string(parentGwObj.Spec.GatewayClassName) == wellknown.AgentgatewayWaypointClassName,
 		}
 
 		res := ListenerSet{
@@ -670,7 +670,7 @@ func (p RouteParents) parentsForService(ctx krt.HandlerContext, pk utils.TypedNa
 
 	// Found a waypoint binding, look up the waypoint's listeners
 	wpKey := utils.TypedNamespacedName{
-		Kind:      wellknown.GatewayKind,
+		Kind: wellknown.GatewayKind,
 		NamespacedName: types.NamespacedName{
 			Name:      binding.WaypointGateway.Name,
 			Namespace: binding.WaypointGateway.Namespace,

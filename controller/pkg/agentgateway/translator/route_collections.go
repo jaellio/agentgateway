@@ -33,6 +33,7 @@ import (
 	"github.com/agentgateway/agentgateway/controller/pkg/pluginsdk/reporter"
 	"github.com/agentgateway/agentgateway/controller/pkg/reports"
 	"github.com/agentgateway/agentgateway/controller/pkg/syncer/status"
+	"github.com/agentgateway/agentgateway/controller/pkg/utils/kubeutils"
 	"github.com/agentgateway/agentgateway/controller/pkg/wellknown"
 )
 
@@ -305,7 +306,7 @@ func buildDelegatedHTTPRoutes(
 				if binding.ServiceKey != nil {
 					route.ServiceKey = &workloadapi.NamespacedHostname{
 						Namespace: binding.ServiceKey.Namespace,
-						Hostname:  binding.ServiceKey.Name,
+						Hostname:  workloadServiceHostname(binding.ServiceKey),
 					}
 					route.Hostnames = nil
 				}
@@ -721,7 +722,7 @@ func resourceMapper(t any, parent RouteParentReference) *api.Resource {
 	if parent.ServiceKey != nil {
 		serviceKey = &workloadapi.NamespacedHostname{
 			Namespace: parent.ServiceKey.Namespace,
-			Hostname:  parent.ServiceKey.Name,
+			Hostname:  workloadServiceHostname(parent.ServiceKey),
 		}
 	}
 
@@ -756,6 +757,16 @@ func resourceMapper(t any, parent RouteParentReference) *api.Resource {
 		log.Fatalf("unknown route kind %T", t)
 		return nil
 	}
+}
+
+func workloadServiceHostname(serviceKey *types.NamespacedName) string {
+	if serviceKey == nil {
+		return ""
+	}
+	if strings.Contains(serviceKey.Name, ".") {
+		return serviceKey.Name
+	}
+	return kubeutils.GetServiceHostname(serviceKey.Name, serviceKey.Namespace)
 }
 
 func routeKeySuffix(parent RouteParentReference) string {

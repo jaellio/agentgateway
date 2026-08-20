@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+  labels:
+    istio.io/dataplane-mode: ambient
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentgateway-egress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: curl
+  namespace: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curl
+  template:
+    metadata:
+      labels:
+        app: curl
+    spec:
+      containers:
+      - name: curl
+        image: curlimages/curl:8.10.1
+        command: ["sleep", "infinity"]
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: agw-gateway-params
+  namespace: agentgateway-egress
+spec:
+  istio:
+    enabled: true
+  service:
+    spec:
+      type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: agw-gateway
+  namespace: agentgateway-egress
+  labels:
+    istio.io/waypoint-for: service
+  annotations:
+    agentgateway.dev/internal-ports: "80"
+spec:
+  gatewayClassName: agentgateway
+  infrastructure:
+    parametersRef:
+      group: agentgateway.dev
+      kind: AgentgatewayParameters
+      name: agw-gateway-params
+  listeners:
+  - name: mesh
+    port: 15008
+    protocol: HBONE
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: inner-http
+    port: 80
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: httpbin-external
+  namespace: agents
+  labels:
+    istio.io/use-waypoint: agw-gateway
+    istio.io/use-waypoint-namespace: agentgateway-egress
+spec:
+  hosts:
+  - httpbin.org
+  location: MESH_EXTERNAL
+  resolution: DNS
+  ports:
+  - number: 80
+    name: http
+    protocol: HTTP
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: httpbin-backend
+  namespace: agentgateway-egress
+spec:
+  static:
+    host: httpbin.org
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: httpbin-via-agw
+  namespace: agentgateway-egress
+spec:
+  parentRefs:
+  - name: agw-gateway
+    sectionName: inner-http
+  hostnames:
+  - httpbin.org
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: httpbin-backend
+    filters:
+    - type: ResponseHeaderModifier
+      responseHeaderModifier:
+        add:
+        - name: x-agw-waypoint
+          value: "true"
