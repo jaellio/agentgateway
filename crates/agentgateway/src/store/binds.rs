@@ -669,6 +669,49 @@ impl Store {
 		}
 	}
 
+	fn service_short_name(hostname: &str) -> &str {
+		hostname.split('.').next().unwrap_or(hostname)
+	}
+
+	fn get_service_target<V>(
+		routes: &HbHashMap<RouteTarget, Arc<V>>,
+		key: &NamespacedHostname,
+	) -> Option<Arc<V>> {
+		if let Some(found) = routes.get(&Self::service_target_ref(key)) {
+			return Some(found.clone());
+		}
+
+		let requested_short = Self::service_short_name(key.hostname.as_str());
+
+		// Compatibility path: service-scoped routes may be keyed by short service
+		// name while discovery uses FQDN hostnames.
+		if requested_short != key.hostname.as_str() {
+			let short_key = NamespacedHostname {
+				namespace: key.namespace.clone(),
+				hostname: requested_short.into(),
+			};
+			if let Some(found) = routes.get(&Self::service_target_ref(&short_key)) {
+				return Some(found.clone());
+			}
+		}
+
+		// Reverse compatibility path: when the lookup key is short and routes are
+		// keyed by FQDN, match by service short name within the same namespace.
+		for (target, value) in routes {
+			let RouteTarget::Service(service_key) = target else {
+				continue;
+			};
+			if service_key.namespace != key.namespace {
+				continue;
+			}
+			if Self::service_short_name(service_key.hostname.as_str()) == requested_short {
+				return Some(value.clone());
+			}
+		}
+
+		None
+	}
+
 	fn route_group_target_ref(route_group: &RouteGroupKey) -> RouteTargetRef<'_> {
 		RouteTargetRef::RouteGroup(route_group.as_str())
 	}
@@ -1803,14 +1846,11 @@ impl Store {
 	}
 
 	pub fn get_service_routes(&self, key: &NamespacedHostname) -> Option<Arc<RouteSet>> {
-		self
-			.http_routes
-			.get(&Self::service_target_ref(key))
-			.cloned()
+		Self::get_service_target(&self.http_routes, key)
 	}
 
 	pub fn get_service_tcp_routes(&self, key: &NamespacedHostname) -> Option<Arc<TCPRouteSet>> {
-		self.tcp_routes.get(&Self::service_target_ref(key)).cloned()
+		Self::get_service_target(&self.tcp_routes, key)
 	}
 
 	fn remove_resource(&mut self, res: &Strng) {

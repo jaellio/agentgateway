@@ -320,6 +320,7 @@ func GatewayTransformationFunc(cfg GatewayCollectionConfig) func(ctx krt.Handler
 				Protocol:               l.Protocol,
 				TLSPassthrough:         l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
 				Internal:               internalPorts.Has(l.Port),
+				Waypoint:               string(obj.Spec.GatewayClassName) == wellknown.AgentgatewayWaypointClassName,
 			}
 
 			res := &GatewayListener{
@@ -588,6 +589,7 @@ func ListenerSetBuilder(
 			Protocol:         l.Protocol,
 			TLSPassthrough:   l.TLS != nil && l.TLS.Mode != nil && *l.TLS.Mode == gwv1.TLSModePassthrough,
 			Internal:         internalPorts.Has(l.Port),
+			Waypoint:         string(parentGwObj.Spec.GatewayClassName) == wellknown.AgentgatewayWaypointClassName,
 		}
 
 		res := ListenerSet{
@@ -637,14 +639,65 @@ type ParentResolver = plugins.ParentResolver
 
 // RouteParents holds information about things Routes can reference as parents.
 type RouteParents struct {
-	Gateways     krt.Collection[*GatewayListener]
-	GatewayIndex krt.Index[utils.TypedNamespacedName, *GatewayListener]
+	Gateways         krt.Collection[*GatewayListener]
+	GatewayIndex     krt.Index[utils.TypedNamespacedName, *GatewayListener]
+	WaypointBindings krt.Collection[WaypointServiceBinding]
+	Services         krt.Collection[*corev1.Service]
 }
 
 // Fetch returns the parents for a given parent key.
+// If the parent is a service, it will resolve the service to the waypoint gateway that fronts it, if any.
 func (p RouteParents) ParentsFor(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+	if pk.Kind == wellknown.ServiceKind {
+		return p.parentsForService(ctx, pk)
+	}
 	return slices.Map(krt.Fetch(ctx, p.Gateways, krt.FilterIndex(p.GatewayIndex, pk)), func(gw *GatewayListener) *ParentInfo {
 		return &gw.ParentInfo
+	})
+}
+
+func (p RouteParents) parentsForService(ctx krt.HandlerContext, pk utils.TypedNamespacedName) []*ParentInfo {
+	if p.WaypointBindings == nil {
+		return nil
+	}
+
+	// Look up the waypoint binding for this service
+	svcKey := pk.Namespace + "/" + pk.Name
+	binding := krt.FetchOne(ctx, p.WaypointBindings, krt.FilterKey(svcKey))
+	if binding == nil {
+		return nil
+	}
+
+	// Found a waypoint binding, look up the waypoint's listeners
+	wpKey := utils.TypedNamespacedName{
+		Kind: wellknown.GatewayKind,
+		NamespacedName: types.NamespacedName{
+			Name:      binding.WaypointGateway.Name,
+			Namespace: binding.WaypointGateway.Namespace,
+		},
+	}
+	// Resolve the referenced Service's ports so that port-qualified parentRefs
+	// (the standard GAMMA pattern, e.g. parentRef with port: 8080) are validated
+	// against the Service ports rather than the waypoint's HBONE listener port.
+	var servicePorts []gwv1.PortNumber
+	if p.Services != nil {
+		if svc := ptr.Flatten(krt.FetchOne(ctx, p.Services, krt.FilterKey(svcKey))); svc != nil {
+			for _, sp := range svc.Spec.Ports {
+				servicePorts = append(servicePorts, gwv1.PortNumber(sp.Port))
+			}
+		}
+	}
+
+	return slices.Map(krt.Fetch(ctx, p.Gateways, krt.FilterIndex(p.GatewayIndex, wpKey)), func(gw *GatewayListener) *ParentInfo {
+		pi := gw.ParentInfo
+		if gw.ParentInfo.Waypoint {
+			pi.ServiceKey = &types.NamespacedName{
+				Namespace: pk.Namespace,
+				Name:      pk.Name,
+			}
+			pi.ServicePorts = servicePorts
+		}
+		return &pi
 	})
 }
 
@@ -666,13 +719,17 @@ func (c *CompositeParentResolver) ParentsFor(ctx krt.HandlerContext, pk utils.Ty
 // BuildRouteParents builds a RouteParents from a collection of gateways.
 func BuildRouteParents(
 	gateways krt.Collection[*GatewayListener],
+	waypointServices krt.Collection[WaypointServiceBinding],
+	services krt.Collection[*corev1.Service],
 ) RouteParents {
 	idx := krt.NewIndex(gateways, "Parent", func(o *GatewayListener) []utils.TypedNamespacedName {
 		return []utils.TypedNamespacedName{o.ParentObject}
 	})
 	return RouteParents{
-		Gateways:     gateways,
-		GatewayIndex: idx,
+		Gateways:         gateways,
+		GatewayIndex:     idx,
+		WaypointBindings: waypointServices,
+		Services:         services,
 	}
 }
 

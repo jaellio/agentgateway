@@ -1,0 +1,1555 @@
+{
+  "backends": [
+    {
+      "backend": {
+        "host": {
+          "name": "httpbin-backend",
+          "namespace": "agentgateway-egress",
+          "target": "httpbin.org:80"
+        }
+      }
+    }
+  ],
+  "binds": [
+    {
+      "address": "[::]:15008",
+      "key": "15008/agentgateway-egress/agw-gateway",
+      "listeners": {
+        "agentgateway-egress/agw-gateway.mesh": {
+          "gatewayName": "agw-gateway",
+          "gatewayNamespace": "agentgateway-egress",
+          "hostname": "",
+          "key": "agentgateway-egress/agw-gateway.mesh",
+          "listenerName": "mesh",
+          "protocol": "HBONE"
+        }
+      },
+      "mode": "standard",
+      "protocol": "http",
+      "tunnelProtocol": "hboneGateway"
+    },
+    {
+      "address": "[::]:80",
+      "key": "80/agentgateway-egress/agw-gateway",
+      "listeners": {
+        "agentgateway-egress/agw-gateway.inner-http": {
+          "gatewayName": "agw-gateway",
+          "gatewayNamespace": "agentgateway-egress",
+          "hostname": "",
+          "key": "agentgateway-egress/agw-gateway.inner-http",
+          "listenerName": "inner-http",
+          "protocol": "HTTP",
+          "routes": {
+            "agentgateway-egress/httpbin-via-agw.00.inner-http": {
+              "backends": [
+                {
+                  "backend": "agentgateway-egress/httpbin-backend",
+                  "weight": 1
+                }
+              ],
+              "hostnames": [
+                "httpbin.org"
+              ],
+              "inlinePolicies": [
+                {
+                  "responseHeaderModifier": {
+                    "add": {
+                      "x-agw-waypoint": "true"
+                    }
+                  }
+                }
+              ],
+              "key": "agentgateway-egress/httpbin-via-agw.00.inner-http",
+              "kind": "HTTPRoute",
+              "matches": [
+                {
+                  "path": {
+                    "pathPrefix": "/"
+                  }
+                }
+              ],
+              "name": "httpbin-via-agw",
+              "namespace": "agentgateway-egress"
+            }
+          }
+        }
+      },
+      "mode": "internal",
+      "protocol": "http",
+      "tunnelProtocol": "direct"
+    }
+  ],
+  "config": {
+    "adminAddr": {
+      "Localhost": [
+        true,
+        15000
+      ]
+    },
+    "backend": {
+      "connectTimeout": "10s",
+      "keepalives": {
+        "enabled": true,
+        "interval": "3m0s",
+        "retries": 9,
+        "time": "3m0s"
+      },
+      "poolIdleTimeout": "1m30s",
+      "poolMaxSize": null
+    },
+    "ca": {
+      "address": "https://istiod.istio-system.svc:15012",
+      "allowedTrustDomains": [
+        "cluster.local"
+      ],
+      "auth": {
+        "token": [
+          "./var/run/secrets/tokens/istio-token",
+          "Kubernetes"
+        ]
+      },
+      "caCert": {
+        "File": "./var/run/secrets/istio/root-cert.pem"
+      },
+      "caHeaders": [],
+      "identity": "spiffe://cluster.local/ns/agentgateway-egress/sa/agw-gateway",
+      "secretTtl": "24h0m0s",
+      "skipValidateTrustDomain": false
+    },
+    "database": null,
+    "dns": {
+      "resolverCfg": {
+        "domain": null,
+        "name_servers": [
+          {
+            "connections": [
+              {
+                "bind_addr": null,
+                "port": 53,
+                "protocol": {
+                  "type": "udp"
+                }
+              },
+              {
+                "bind_addr": null,
+                "port": 53,
+                "protocol": {
+                  "type": "tcp"
+                }
+              }
+            ],
+            "ip": "10.96.0.10",
+            "trust_negative_responses": true
+          }
+        ],
+        "search": [
+          "agentgateway-egress.svc.cluster.local",
+          "svc.cluster.local",
+          "cluster.local"
+        ]
+      },
+      "resolverOpts": {
+        "allow_answers": [],
+        "attempts": 2,
+        "avoid_local_udp_ports": [],
+        "cache_size": 8192,
+        "case_randomization": false,
+        "deny_answers": [],
+        "edns0": false,
+        "edns_payload_len": 1232,
+        "ip_strategy": "Ipv4thenIpv6",
+        "max_active_requests": 32,
+        "ndots": 5,
+        "negative_max_ttl": null,
+        "negative_min_ttl": null,
+        "num_concurrent_reqs": 2,
+        "os_port_selection": false,
+        "positive_max_ttl": null,
+        "positive_min_ttl": null,
+        "preserve_intermediates": true,
+        "recursion_desired": true,
+        "server_ordering_strategy": "QueryStatistics",
+        "timeout": 5,
+        "trust_anchor": null,
+        "try_tcp_on_error": false,
+        "use_hosts_file": "Auto"
+      }
+    },
+    "dynamicCaCertCache": {
+      "capacity": 256,
+      "ttl": "5m0s"
+    },
+    "hbone": {
+      "connectionWindowSize": 16777216,
+      "frameSize": 1048576,
+      "poolMaxStreamsPerConn": 100,
+      "poolUnusedReleaseTimeout": {
+        "nanos": 0,
+        "secs": 300
+      },
+      "windowSize": 4194304
+    },
+    "ipv6Enabled": true,
+    "logging": {
+      "database": null,
+      "database_fields": {
+        "add": {},
+        "remove": []
+      },
+      "fields": {
+        "add": {},
+        "remove": []
+      },
+      "filter": null,
+      "format": "text",
+      "level": ""
+    },
+    "mcp": {
+      "sessionTtl": "30m0s"
+    },
+    "metrics": {
+      "excluded_metrics": [],
+      "metric_fields": {
+        "add": {}
+      }
+    },
+    "modelCatalog": {
+      "sources": []
+    },
+    "network": "",
+    "numWorkerThreads": 16,
+    "oidcCookieEncoder": null,
+    "proxyMetadata": {
+      "instanceIp": "10.244.0.45",
+      "nodeId": "agentgateway~10.244.0.45~agw-gateway-68867df46c-bck7z.agentgateway-egress~agentgateway-egress.svc.cluster.local",
+      "nodeName": "kind-control-plane",
+      "podName": "agw-gateway-68867df46c-bck7z",
+      "podNamespace": "agentgateway-egress",
+      "role": "agentgateway-egress~agw-gateway"
+    },
+    "readinessAddr": {
+      "SocketAddr": "[::]:15021"
+    },
+    "selfAddr": {
+      "gateway": "agw-gateway",
+      "namespace": "agentgateway-egress"
+    },
+    "selfIdentity": {
+      "wds": {
+        "cluster_id": "Kubernetes",
+        "name": "agw-gateway-68867df46c-bck7z",
+        "namespace": "agentgateway-egress"
+      }
+    },
+    "sessionEncoder": "aes",
+    "statsAddr": {
+      "SocketAddr": "[::]:15020"
+    },
+    "storage": {
+      "mode": "file"
+    },
+    "terminationMaxDeadline": "55s",
+    "terminationMinDeadline": "10s",
+    "threadingMode": "multithreaded",
+    "tracing": null,
+    "xds": {
+      "address": "https://agentgateway.agentgateway-system.svc.cluster.local:9978",
+      "auth": {
+        "token": [
+          "./var/run/secrets/xds-tokens/xds-token",
+          "Kubernetes"
+        ]
+      },
+      "caCert": {
+        "File": "/etc/xds-tls/ca.crt"
+      },
+      "gateway": "agw-gateway",
+      "localConfig": "/config/config.yaml",
+      "namespace": "agentgateway-egress"
+    }
+  },
+  "policies": [],
+  "routes": {
+    "httpMesh": {},
+    "routeGroups": {},
+    "tcpMesh": {}
+  },
+  "services": [
+    {
+      "appProtocols": {
+        "9978": "Grpc"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agentgateway-system/agentgateway-54ff98884-tmnqq": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "9092": 9092,
+                  "9093": 9093,
+                  "9978": 9978
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agentgateway-system/agentgateway-54ff98884-tmnqq"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "agentgateway.agentgateway-system.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "agentgateway",
+      "namespace": "agentgateway-system",
+      "ports": {
+        "9092": 0,
+        "9093": 0,
+        "9978": 0
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.153.206"
+      ]
+    },
+    {
+      "appProtocols": {},
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agentgateway-egress/agw-gateway-68867df46c-bck7z": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "15008": 15008
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agentgateway-egress/agw-gateway-68867df46c-bck7z"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "agw-gateway.agentgateway-egress.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "agw-gateway",
+      "namespace": "agentgateway-egress",
+      "ports": {
+        "15008": 15008
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.165.84"
+      ]
+    },
+    {
+      "appProtocols": {},
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-e2e/agw-waypoint-74d49d4bd6-vz4ht": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "15008": 15008
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-e2e/agw-waypoint-74d49d4bd6-vz4ht"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "agw-waypoint.agw-waypoint-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "agw-waypoint",
+      "namespace": "agw-waypoint-e2e",
+      "ports": {
+        "15008": 15008
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.41.215"
+      ]
+    },
+    {
+      "appProtocols": {},
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-mesh-e2e/agw-waypoint-c8f9d44b9-xtwdw": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "15008": 15008
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-mesh-e2e/agw-waypoint-c8f9d44b9-xtwdw"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "agw-waypoint.agw-waypoint-mesh-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "agw-waypoint",
+      "namespace": "agw-waypoint-mesh-e2e",
+      "ports": {
+        "15008": 15008
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.33.186"
+      ]
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-e2e/backend-b-7c54f989fc-tqkp9": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "80": 8080
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-e2e/backend-b-7c54f989fc-tqkp9"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "backend-b.agw-waypoint-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "backend-b",
+      "namespace": "agw-waypoint-e2e",
+      "ports": {
+        "80": 8080
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.158.14"
+      ]
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-mesh-e2e/backend-c548b79c4-hxrdp": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "80": 8080
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-mesh-e2e/backend-c548b79c4-hxrdp"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "backend-direct.agw-waypoint-mesh-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "backend-direct",
+      "namespace": "agw-waypoint-mesh-e2e",
+      "ports": {
+        "80": 8080
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.147.45"
+      ]
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-e2e/backend-69cf876bf4-6bgtc": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "80": 8080
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-e2e/backend-69cf876bf4-6bgtc"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "backend.agw-waypoint-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "backend",
+      "namespace": "agw-waypoint-e2e",
+      "ports": {
+        "80": 8080
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.161.234"
+      ]
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/agw-waypoint-mesh-e2e/backend-c548b79c4-hxrdp": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "80": 8080
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/agw-waypoint-mesh-e2e/backend-c548b79c4-hxrdp"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "backend.agw-waypoint-mesh-e2e.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "backend",
+      "namespace": "agw-waypoint-mesh-e2e",
+      "ports": {
+        "80": 8080
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.3.57"
+      ],
+      "waypoint": {
+        "destination": "/10.96.33.186",
+        "hboneMtlsPort": 15008
+      }
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {},
+          "rejected": {}
+        }
+      ],
+      "hostname": "frontend.agw-waypoint-e2e.svc.cluster.local",
+      "ingressUseWaypoint": true,
+      "ipFamilies": "IPv4",
+      "name": "frontend",
+      "namespace": "agw-waypoint-e2e",
+      "ports": {
+        "80": 8080
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.43.84"
+      ],
+      "waypoint": {
+        "destination": "/10.96.41.215",
+        "hboneMtlsPort": 15008
+      }
+    },
+    {
+      "appProtocols": {
+        "80": "Http11"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "/networking.istio.io/ServiceEntry/agents/httpbin-external/httpbin.org": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "80": 80
+                },
+                "status": "Healthy",
+                "workloadUid": "/networking.istio.io/ServiceEntry/agents/httpbin-external/httpbin.org"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "httpbin.org",
+      "name": "httpbin-external",
+      "namespace": "agents",
+      "ports": {
+        "80": 80
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/240.240.0.1",
+        "/2001:2::1"
+      ],
+      "waypoint": {
+        "destination": "/10.96.165.84",
+        "hboneMtlsPort": 15008
+      }
+    },
+    {
+      "appProtocols": {
+        "15010": "Grpc",
+        "15012": "Tls",
+        "15014": "Http11",
+        "443": "Tls"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/istio-system/istiod-7fffbcb657-jxgvr": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "15010": 15010,
+                  "15012": 15012,
+                  "15014": 15014,
+                  "443": 15017
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/istio-system/istiod-7fffbcb657-jxgvr"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "istiod.istio-system.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "istiod",
+      "namespace": "istio-system",
+      "ports": {
+        "15010": 15010,
+        "15012": 15012,
+        "15014": 15014,
+        "443": 15017
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.157.91"
+      ]
+    },
+    {
+      "appProtocols": {
+        "53": "Tcp"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/kube-system/coredns-589f44dc88-4x7pw": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "53": 53,
+                  "9153": 9153
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/kube-system/coredns-589f44dc88-4x7pw"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            },
+            "//Pod/kube-system/coredns-589f44dc88-fk6hx": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "53": 53,
+                  "9153": 9153
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/kube-system/coredns-589f44dc88-fk6hx"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "kube-dns.kube-system.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "kube-dns",
+      "namespace": "kube-system",
+      "ports": {
+        "53": 53,
+        "9153": 9153
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.0.10"
+      ]
+    },
+    {
+      "appProtocols": {
+        "443": "Tls"
+      },
+      "endpoints": [
+        {
+          "active": {
+            "/discovery.k8s.io/EndpointSlice/default/kubernetes/172.18.0.2": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "443": 6443
+                },
+                "status": "Healthy",
+                "workloadUid": "/discovery.k8s.io/EndpointSlice/default/kubernetes/172.18.0.2"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "kubernetes.default.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "kubernetes",
+      "namespace": "default",
+      "ports": {
+        "443": 6443
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.0.1"
+      ]
+    },
+    {
+      "appProtocols": {},
+      "endpoints": [
+        {
+          "active": {
+            "//Pod/metallb-system/controller-77f7b7f69d-hbhkt": {
+              "capacity": 1,
+              "endpoint": {
+                "port": {
+                  "443": 9443
+                },
+                "status": "Healthy",
+                "workloadUid": "//Pod/metallb-system/controller-77f7b7f69d-hbhkt"
+              },
+              "info": {
+                "consecutiveFailures": 0,
+                "evictedUntil": null,
+                "health": 1,
+                "pendingRequests": 0,
+                "requestLatency": 0,
+                "timesEjected": 0,
+                "totalRequests": 0
+              }
+            }
+          },
+          "rejected": {}
+        }
+      ],
+      "hostname": "webhook-service.metallb-system.svc.cluster.local",
+      "ipFamilies": "IPv4",
+      "name": "webhook-service",
+      "namespace": "metallb-system",
+      "ports": {
+        "443": 9443
+      },
+      "subjectAltNames": [],
+      "vips": [
+        "/10.96.224.34"
+      ]
+    }
+  ],
+  "version": {
+    "build_profile": "release",
+    "build_target": "x86_64-unknown-linux-gnu",
+    "git_revision": "89f3f08f22d93ce9af419e84cff7b412497fec80",
+    "rust_version": "1.97.0",
+    "version": "89f3f08f22"
+  },
+  "workloads": [
+    {
+      "canonicalName": "agw-gateway",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "agw-gateway-68867df46c-bck7z",
+      "namespace": "agentgateway-egress",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "agw-gateway",
+      "services": {
+        "agentgateway-egress/agw-gateway.agentgateway-egress.svc.cluster.local": {
+          "15008": 15008
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agentgateway-egress/agw-gateway-68867df46c-bck7z",
+      "workloadIps": [
+        "10.244.0.45"
+      ],
+      "workloadName": "agw-gateway",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "agentgateway",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "agentgateway-54ff98884-tmnqq",
+      "namespace": "agentgateway-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "agentgateway",
+      "services": {
+        "agentgateway-system/agentgateway.agentgateway-system.svc.cluster.local": {
+          "9092": 9092,
+          "9093": 9093,
+          "9978": 9978
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agentgateway-system/agentgateway-54ff98884-tmnqq",
+      "workloadIps": [
+        "10.244.0.26"
+      ],
+      "workloadName": "agentgateway",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "curl",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "curl-588f749d75-s8lg5",
+      "namespace": "agents",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "HBONE",
+      "serviceAccount": "default",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agents/curl-588f749d75-s8lg5",
+      "workloadIps": [
+        "10.244.0.43"
+      ],
+      "workloadName": "curl",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "agw-waypoint",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "agw-waypoint-74d49d4bd6-vz4ht",
+      "namespace": "agw-waypoint-e2e",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "agw-waypoint",
+      "services": {
+        "agw-waypoint-e2e/agw-waypoint.agw-waypoint-e2e.svc.cluster.local": {
+          "15008": 15008
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agw-waypoint-e2e/agw-waypoint-74d49d4bd6-vz4ht",
+      "workloadIps": [
+        "10.244.0.24"
+      ],
+      "workloadName": "agw-waypoint",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "backend",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "backend-69cf876bf4-6bgtc",
+      "namespace": "agw-waypoint-e2e",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "HBONE",
+      "serviceAccount": "default",
+      "services": {
+        "agw-waypoint-e2e/backend.agw-waypoint-e2e.svc.cluster.local": {
+          "80": 8080
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agw-waypoint-e2e/backend-69cf876bf4-6bgtc",
+      "workloadIps": [
+        "10.244.0.37"
+      ],
+      "workloadName": "backend",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "backend-b",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "backend-b-7c54f989fc-tqkp9",
+      "namespace": "agw-waypoint-e2e",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "HBONE",
+      "serviceAccount": "default",
+      "services": {
+        "agw-waypoint-e2e/backend-b.agw-waypoint-e2e.svc.cluster.local": {
+          "80": 8080
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agw-waypoint-e2e/backend-b-7c54f989fc-tqkp9",
+      "workloadIps": [
+        "10.244.0.38"
+      ],
+      "workloadName": "backend-b",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "agw-waypoint",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "agw-waypoint-c8f9d44b9-xtwdw",
+      "namespace": "agw-waypoint-mesh-e2e",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "agw-waypoint",
+      "services": {
+        "agw-waypoint-mesh-e2e/agw-waypoint.agw-waypoint-mesh-e2e.svc.cluster.local": {
+          "15008": 15008
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agw-waypoint-mesh-e2e/agw-waypoint-c8f9d44b9-xtwdw",
+      "workloadIps": [
+        "10.244.0.27"
+      ],
+      "workloadName": "agw-waypoint",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "backend",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "backend-c548b79c4-hxrdp",
+      "namespace": "agw-waypoint-mesh-e2e",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "HBONE",
+      "serviceAccount": "default",
+      "services": {
+        "agw-waypoint-mesh-e2e/backend-direct.agw-waypoint-mesh-e2e.svc.cluster.local": {
+          "80": 8080
+        },
+        "agw-waypoint-mesh-e2e/backend.agw-waypoint-mesh-e2e.svc.cluster.local": {
+          "80": 8080
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/agw-waypoint-mesh-e2e/backend-c548b79c4-hxrdp",
+      "workloadIps": [
+        "10.244.0.39"
+      ],
+      "workloadName": "backend",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "istio-cni",
+      "canonicalRevision": "1.0.0",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "istio-cni-node-xmkpn",
+      "namespace": "istio-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "istio-cni",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/istio-system/istio-cni-node-xmkpn",
+      "workloadIps": [
+        "10.244.0.10"
+      ],
+      "workloadName": "istio-cni-node",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "istiod",
+      "canonicalRevision": "1.0.0",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "istiod-7fffbcb657-jxgvr",
+      "namespace": "istio-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "istiod",
+      "services": {
+        "istio-system/istiod.istio-system.svc.cluster.local": {
+          "15010": 15010,
+          "15012": 15012,
+          "15014": 15014,
+          "443": 15017
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/istio-system/istiod-7fffbcb657-jxgvr",
+      "workloadIps": [
+        "10.244.0.36"
+      ],
+      "workloadName": "istiod",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "ztunnel",
+      "canonicalRevision": "1.0.0",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "ztunnel-wk8rh",
+      "namespace": "istio-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "ztunnel",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/istio-system/ztunnel-wk8rh",
+      "workloadIps": [
+        "10.244.0.25"
+      ],
+      "workloadName": "ztunnel",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "coredns",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "coredns-589f44dc88-4x7pw",
+      "namespace": "kube-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "coredns",
+      "services": {
+        "kube-system/kube-dns.kube-system.svc.cluster.local": {
+          "53": 53,
+          "9153": 9153
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/coredns-589f44dc88-4x7pw",
+      "workloadIps": [
+        "10.244.0.22"
+      ],
+      "workloadName": "coredns",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "coredns",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "coredns-589f44dc88-fk6hx",
+      "namespace": "kube-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "coredns",
+      "services": {
+        "kube-system/kube-dns.kube-system.svc.cluster.local": {
+          "53": 53,
+          "9153": 9153
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/coredns-589f44dc88-fk6hx",
+      "workloadIps": [
+        "10.244.0.23"
+      ],
+      "workloadName": "coredns",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "etcd-kind-control-plane",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "etcd-kind-control-plane",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/etcd-kind-control-plane",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "etcd-kind-control-plane",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "kindnet",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "kindnet-pzswh",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "kindnet",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/kindnet-pzswh",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "kindnet",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "kube-apiserver-kind-control-plane",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "kube-apiserver-kind-control-plane",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/kube-apiserver-kind-control-plane",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "kube-apiserver-kind-control-plane",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "kube-controller-manager-kind-control-plane",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "kube-controller-manager-kind-control-plane",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/kube-controller-manager-kind-control-plane",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "kube-controller-manager-kind-control-plane",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "kube-proxy",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "kube-proxy-wj9zm",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "kube-proxy",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/kube-proxy-wj9zm",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "kube-proxy",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "kube-scheduler-kind-control-plane",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "kube-scheduler-kind-control-plane",
+      "namespace": "kube-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/kube-system/kube-scheduler-kind-control-plane",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "kube-scheduler-kind-control-plane",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "local-path-provisioner",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "local-path-provisioner-855c7b7774-ps47h",
+      "namespace": "local-path-storage",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "local-path-provisioner-service-account",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/local-path-storage/local-path-provisioner-855c7b7774-ps47h",
+      "workloadIps": [
+        "10.244.0.33"
+      ],
+      "workloadName": "local-path-provisioner",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "metallb",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "controller-77f7b7f69d-hbhkt",
+      "namespace": "metallb-system",
+      "networkMode": "Standard",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "controller",
+      "services": {
+        "metallb-system/webhook-service.metallb-system.svc.cluster.local": {
+          "443": 9443
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/metallb-system/controller-77f7b7f69d-hbhkt",
+      "workloadIps": [
+        "10.244.0.28"
+      ],
+      "workloadName": "controller",
+      "workloadType": "pod"
+    },
+    {
+      "canonicalName": "metallb",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "locality": {
+        "region": "region",
+        "subzone": "",
+        "zone": "zone"
+      },
+      "name": "speaker-nn578",
+      "namespace": "metallb-system",
+      "networkMode": "HostNetwork",
+      "node": "kind-control-plane",
+      "protocol": "TCP",
+      "serviceAccount": "speaker",
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "//Pod/metallb-system/speaker-nn578",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadName": "speaker",
+      "workloadType": "pod"
+    },
+    {
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "name": "kubernetes",
+      "namespace": "default",
+      "networkMode": "HostNetwork",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "services": {
+        "default/kubernetes.default.svc.cluster.local": {
+          "443": 6443
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "/discovery.k8s.io/EndpointSlice/default/kubernetes/172.18.0.2",
+      "workloadIps": [
+        "172.18.0.2"
+      ],
+      "workloadType": "deployment"
+    },
+    {
+      "canonicalName": "httpbin-external",
+      "canonicalRevision": "latest",
+      "capacity": 1,
+      "clusterId": "Kubernetes",
+      "hostname": "httpbin.org",
+      "name": "httpbin-external",
+      "namespace": "agents",
+      "networkMode": "Standard",
+      "protocol": "TCP",
+      "serviceAccount": "default",
+      "services": {
+        "agents/httpbin.org": {
+          "80": 80
+        }
+      },
+      "status": "Healthy",
+      "trustDomain": "cluster.local",
+      "uid": "/networking.istio.io/ServiceEntry/agents/httpbin-external/httpbin.org",
+      "workloadIps": [],
+      "workloadName": "httpbin-external",
+      "workloadType": "pod"
+    }
+  ]
+}

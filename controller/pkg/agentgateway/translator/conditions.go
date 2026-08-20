@@ -160,8 +160,11 @@ func GenerateSupportedKinds(l gwv1.Listener, enableAgentgatewayModels bool) ([]g
 		}
 		// UDP route not support
 	case gwv1.ProtocolType(protocol.HBONE):
-		// HBONE is a tunnel terminator — routes attach to inner listeners, not here.
-		supported = []gwv1.RouteGroupKind{}
+		supported = []gwv1.RouteGroupKind{
+			toRouteKind(wellknown.HTTPRouteGVK),
+			toRouteKind(wellknown.GRPCRouteGVK),
+			toRouteKind(wellknown.TCPRouteGVK),
+		}
 	}
 	if l.AllowedRoutes != nil && len(l.AllowedRoutes.Kinds) > 0 {
 		// We need to filter down to only ones we actually support

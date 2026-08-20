@@ -814,6 +814,57 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_service_tcp_route_short_service_key_match() {
+		let svc = make_service(
+			"mysql-db",
+			"default",
+			"mysql-db.default.svc.cluster.local",
+			"10.0.0.50",
+			"network",
+			Some(GatewayAddress {
+				destination: Destination::Hostname(NamespacedHostname {
+					namespace: strng::new("istio-system"),
+					hostname: strng::new("my-waypoint.istio-system.svc.cluster.local"),
+				}),
+				hbone_mtls_port: 15008,
+			}),
+		);
+		let stores = stores_with_services(vec![svc]);
+		let short_key = NamespacedHostname {
+			namespace: strng::new("default"),
+			hostname: strng::new("mysql-db"),
+		};
+		{
+			let mut binds = stores.binds.write();
+			binds.insert_service_tcp_route(
+				crate::types::agent::TCPRoute {
+					key: strng::literal!("mysql-tcp-route-short"),
+					service_key: Some(short_key.clone()),
+					service_port: 0,
+					name: Default::default(),
+					hostnames: vec![],
+					backends: vec![],
+				},
+				short_key,
+			);
+		}
+		let network = strng::literal!("network");
+		let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50)), 3306);
+		let self_addr = make_self_addr("my-waypoint", "istio-system");
+
+		let route = super::select_best_route(
+			None,
+			hbone_listener(),
+			&stores,
+			&network,
+			dst,
+			Some(&self_addr),
+		);
+		assert!(route.is_some(), "should match short-keyed service TCP route");
+		assert_eq!(route.unwrap().key.as_str(), "mysql-tcp-route-short");
+	}
+
+	#[tokio::test]
 	async fn test_service_tcp_route_port_scoping() {
 		// Two service TCP routes differ only by service_port. A connection selects
 		// the route scoped to its port; a port with no matching route is rejected.
