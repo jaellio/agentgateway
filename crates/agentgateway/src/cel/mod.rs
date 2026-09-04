@@ -131,6 +131,8 @@ flagset::flags! {
 
 		Mcp,
 
+		Guardrails,
+
 		Extauthz,
 		Extproc,
 		Metadata,
@@ -178,6 +180,13 @@ impl ContextBuilder {
 	}
 	pub fn register_log_request(&mut self) {
 		self.logging_attributes |= Attributes::Request;
+	}
+	/// Request full LLM payload capture for the database log sink without requiring a CEL
+	/// expression to also emit that payload as an attribute.
+	pub fn register_log_llm_payload(&mut self) {
+		// Response translators only retain structured tool calls when this attribute is requested.
+		self.logging_attributes |=
+			Attributes::Llm | Attributes::LlmCompletion | Attributes::LlmToolCalls;
 	}
 	fn any_has(&self, attr: impl Into<FlagSet<Attributes>>) -> bool {
 		let x = attr.into();
@@ -412,6 +421,9 @@ fn attributes_for(expression: &cel::IdedExpr) -> FlagSet<Attributes> {
 			},
 			["mcp", ..] => {
 				attributes |= Attributes::Mcp;
+			},
+			["guardrails", ..] => {
+				attributes |= Attributes::Guardrails;
 			},
 			["extauthz", ..] => {
 				attributes |= Attributes::Extauthz;

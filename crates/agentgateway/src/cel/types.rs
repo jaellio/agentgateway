@@ -75,13 +75,28 @@ pub struct Executor<'a> {
 	#[dynamic(rename = "mcpGuardrails")]
 	pub mcp_guardrails: ExtensionOrDirect<'a, McpGuardrailsDynamicMetadata>,
 
+	pub guardrails: Option<&'a Vec<GuardrailInfo>>,
+
 	pub metadata: ExtensionOrDirect<'a, TransformationMetadata>,
+}
+
+#[apply(schema!)]
+#[derive(cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct ErrorContext {
+	/// Broad classification of the failure, such as `UpstreamFailure` or `Timeout`.
+	pub reason: String,
+	/// Human-readable failure detail. Exact message is subject to change.
+	pub message: String,
 }
 
 #[apply(schema!)]
 #[derive(Default, cel::DynamicType)]
 #[dynamic(rename_all = "camelCase")]
 pub struct ProxyContext {
+	/// The final gateway error when the response was synthesized from a failed request.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<ErrorContext>,
 	/// The bind that accepted the request.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub bind: Option<Strng>,
@@ -125,6 +140,7 @@ impl ProxyContext {
 		response_processing_duration: Option<std::time::Duration>,
 	) -> Self {
 		Self {
+			error: None,
 			bind: None,
 			gateway: None,
 			listener: None,
@@ -326,6 +342,9 @@ pub struct DestinationContext {
 	#[serde(default)]
 	/// The port of the downstream request destination at agentgateway.
 	pub port: u16,
+	/// The requested destination hostname, when known. For TLS connections this is the sniffed SNI.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hostname: Option<Strng>,
 }
 
 #[apply(schema!)]
@@ -368,6 +387,7 @@ impl DestinationContext {
 		Self {
 			address: tcp.local_addr.ip(),
 			port: tcp.local_addr.port(),
+			hostname: None,
 		}
 	}
 }
@@ -623,11 +643,18 @@ impl<'a> Executor<'a> {
 		this.llm_request = Some(llm_body);
 		this
 	}
+	pub fn new_llm_request<B>(req: &'a ::http::Request<B>, llm_body: &'a serde_json::Value) -> Self {
+		let mut this = Self::new_empty();
+		this.set_request(req);
+		this.llm_request = Some(llm_body);
+		this
+	}
 	pub fn new_logger(
 		req: Option<&'a RequestSnapshot>,
 		resp: Option<&'a ResponseSnapshot>,
 		llm: Option<&'a LLMContext>,
 		mcp: Option<&'a MCPInfo>,
+		guardrails: Option<&'a Vec<GuardrailInfo>>,
 		end_time: Option<&'a RequestTime>,
 		proxy: Option<&'a ProxyContext>,
 	) -> Self {
@@ -640,6 +667,7 @@ impl<'a> Executor<'a> {
 		}
 		this.llm = ExtensionOrDirect::Direct(llm);
 		this.mcp = mcp;
+		this.guardrails = guardrails;
 		if let Some(proxy) = proxy {
 			this.proxy = ExtensionOrDirect::Direct(Some(proxy));
 		}
@@ -669,6 +697,15 @@ impl<'a> Executor<'a> {
 		if let Some(f) = this.request.as_mut() {
 			f.end_time = Some(end_time);
 		}
+		this
+	}
+	pub fn new_tcp(
+		source_context: Option<&'a SourceContext>,
+		destination_context: &'a DestinationContext,
+	) -> Self {
+		let mut this = Self::new_empty();
+		this.source = ExtensionOrDirect::Direct(source_context);
+		this.destination = ExtensionOrDirect::Direct(Some(destination_context));
 		this
 	}
 	pub fn new_source(source_context: &'a SourceContext) -> Self {
@@ -1389,6 +1426,57 @@ impl PartialEq for RequestRef<'_> {
 	}
 }
 
+/// Records one prompt-guard guardrail intervention.
+#[apply(schema!)]
+#[derive(Default, cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct GuardrailInfo {
+	/// The phase the guardrail intervened in: `request` or `response`.
+	pub phase: Strng,
+	/// The guard kind that intervened, such as `bedrockGuardrails`.
+	pub guard: Strng,
+	/// The action the guardrail took (mask/reject/audit/failOpen).
+	pub action: Strng,
+	#[serde(flatten, default)]
+	#[dynamic(flatten)]
+	pub detail: GuardDetail,
+}
+
+#[apply(schema!)]
+#[derive(Default, cel::DynamicType)]
+#[dynamic(rename_all = "camelCase")]
+pub struct GuardDetail {
+	/// The configured guardrail identifier.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub guardrail_id: Option<Strng>,
+	/// The configured guardrail version.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub guardrail_version: Option<Strng>,
+	/// The reason the guardrail reported for its action.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub action_reason: Option<String>,
+	/// Assessment detail reported by the guardrail provider, redacted to metadata
+	/// only. Content-bearing fields (such as the matched text) are never included.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub assessments: Vec<serde_json::Value>,
+}
+
+impl GuardrailInfo {
+	/// Minimal details about which guardrail fired, when it fired and what the action was.
+	/// Does not include detailed reasons or assessments.
+	pub fn minimal(&self) -> serde_json::Value {
+		let mut entry = serde_json::json!({
+			"phase": self.phase,
+			"guard": self.guard,
+			"action": self.action,
+		});
+		if let Some(id) = &self.detail.guardrail_id {
+			entry["guardrailId"] = id.as_str().into();
+		}
+		entry
+	}
+}
+
 #[apply(schema!)]
 #[derive(cel::DynamicType)]
 pub struct LLMContext {
@@ -1403,10 +1491,16 @@ pub struct LLMContext {
 	pub response_model: Option<Strng>,
 	/// The provider of the LLM.
 	pub provider: Strng,
-	/// The number of tokens in the input/prompt.
+	/// The total number of tokens in the input/prompt, including tokens read from or written to
+	/// cache. This has consistent semantics across providers.
 	#[dynamic(rename = "inputTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub input_tokens: Option<u64>,
+	/// The provider-reported number of tokens in the input/prompt. This is inconsistent across
+	/// providers: some include cached tokens while others exclude them.
+	#[dynamic(rename = "providerInputTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub provider_input_tokens: Option<u64>,
 	/// The number of image tokens in the input/prompt.
 	#[dynamic(rename = "inputImageTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1451,10 +1545,16 @@ pub struct LLMContext {
 	#[dynamic(rename = "reasoningTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub reasoning_tokens: Option<u64>,
-	/// The total number of tokens for the request.
+	/// The total number of input and output tokens for the request. Input tokens include tokens read
+	/// from or written to cache, giving this field consistent semantics across providers.
 	#[dynamic(rename = "totalTokens")]
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub total_tokens: Option<u64>,
+	/// The provider-reported total number of tokens for the request. This is inconsistent across
+	/// providers because some include cached input tokens while others exclude them.
+	#[dynamic(rename = "providerTotalTokens")]
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub provider_total_tokens: Option<u64>,
 	/// The service tier the provider served the request under.
 	#[dynamic(rename = "serviceTier")]
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1493,29 +1593,34 @@ pub struct LLMContext {
 	/// The realized USD cost of the request from the model cost catalog.
 	/// Unset when the model could not be priced.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cost: Option<llm::cost::Breakdown>,
+	pub cost: Option<llm::catalog::Breakdown>,
 	/// Effective model catalog rates in USD per 1M tokens after tier selection.
 	/// Unset when the model could not be priced.
 	#[dynamic(rename = "costRates")]
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub cost_rates: Option<llm::cost::CostRates>,
+	pub cost_rates: Option<llm::catalog::CostRates>,
 	#[serde(skip)]
 	#[dynamic(skip)]
-	pub cost_status: Option<llm::cost::CostLookupStatus>,
+	pub cost_status: Option<llm::catalog::CostLookupStatus>,
 }
 
 impl LLMContext {
-	pub fn from_llm_info(value: LLMInfo, model_catalog: Option<&llm::cost::ModelCatalog>) -> Self {
+	pub fn from_llm_info(value: LLMInfo, model_catalog: Option<&llm::catalog::ModelCatalog>) -> Self {
+		let legacy_token_semantics = *LEGACY_LLM_USAGE_TOKEN_SEMANTICS;
 		let projection = model_catalog.map(|catalog| catalog.project(&value));
+		let normalized_input_tokens = value.normalized_input_tokens();
+		let cache_convention = value.request.cache_convention;
 
 		let resp = value.response;
 		let mut base = LLMContext {
+			provider_input_tokens: resp.input_tokens,
 			output_tokens: resp.output_tokens,
 			output_image_tokens: resp.output_image_tokens,
 			output_text_tokens: resp.output_text_tokens,
 			output_audio_tokens: resp.output_audio_tokens,
 			count_tokens: resp.count_tokens,
-			total_tokens: resp.total_tokens,
+			total_tokens: None,
+			provider_total_tokens: resp.total_tokens,
 			first_token: resp.first_token,
 			time_to_first_token: None,
 			time_per_output_token: None,
@@ -1536,9 +1641,23 @@ impl LLMContext {
 			..LLMContext::from(value.request)
 		};
 
-		if let Some(pt) = resp.input_tokens {
-			// Better info, override
-			base.input_tokens = Some(pt);
+		if legacy_token_semantics {
+			base.input_tokens = base.provider_input_tokens.or(base.input_tokens);
+			base.total_tokens = base.provider_total_tokens;
+		} else {
+			base.input_tokens = normalized_input_tokens;
+		}
+		if !legacy_token_semantics {
+			base.total_tokens = match (base.input_tokens, base.output_tokens) {
+				(Some(input), Some(output)) => Some(input.saturating_add(output)),
+				_ => resp.total_tokens.map(|total| {
+					cache_convention.include_cache_tokens(
+						total,
+						resp.cached_input_tokens,
+						resp.cache_creation_input_tokens,
+					)
+				}),
+			};
 		}
 
 		if let Some(projection) = projection {
@@ -1590,6 +1709,7 @@ impl From<llm::LLMRequest> for LLMContext {
 			request_model,
 			provider,
 			input_tokens,
+			provider_input_tokens: None,
 			params,
 			prompt,
 
@@ -1603,6 +1723,7 @@ impl From<llm::LLMRequest> for LLMContext {
 			output_text_tokens: None,
 			output_audio_tokens: None,
 			total_tokens: None,
+			provider_total_tokens: None,
 			completion: None,
 			tool_calls: None,
 			reasoning_tokens: None,
@@ -1618,6 +1739,11 @@ impl From<llm::LLMRequest> for LLMContext {
 		}
 	}
 }
+
+static LEGACY_LLM_USAGE_TOKEN_SEMANTICS: Lazy<bool> = Lazy::new(|| {
+	std::env::var("AGENTGATEWAY_LEGACY_LLM_USAGE_TOKEN_SEMANTICS")
+		.is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+});
 
 fn to_value_str<'a, T: AsRef<str>>(c: &'a &'a T) -> Value<'a> {
 	Value::String(c.as_ref().into())
@@ -2027,6 +2153,8 @@ pub struct ExecutorSerde {
 	pub jwt: Option<jwt::Claims>,
 
 	/// `apiKey` contains the claims from a verified API Key. This is only present if the API Key policy is enabled.
+	/// In addition to `key`, user-supplied metadata fields are flattened into this object; for example,
+	/// `apiKey.group`. Metadata values are plain JSON and are not treated as secrets.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub api_key: Option<apikey::Claims>,
 
@@ -2052,8 +2180,9 @@ pub struct ExecutorSerde {
 	pub destination: Option<DestinationContext>,
 
 	/// `mcp` contains attributes about the MCP request.
-	/// Request-time CEL only includes identity fields such as `tool`, `prompt`, or `resource`.
-	/// Post-request CEL may also include fields like `methodName`, `sessionId`, and tool payloads.
+	/// Request-time CEL includes identity fields (`tool`, `prompt`, `resource`,
+	/// `task`) plus `methodName`. Post-request CEL may also include fields like
+	/// `sessionId` and tool payloads.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub mcp: Option<MCPInfo>,
 
@@ -2076,6 +2205,12 @@ pub struct ExecutorSerde {
 		rename = "mcpGuardrails"
 	)]
 	pub mcp_guardrails: Option<McpGuardrailsDynamicMetadata>,
+
+	/// `guardrails` contains one entry per prompt-guard guardrail intervention, in either the
+	/// request or response phase. Only present in CEL that runs after the request completes,
+	/// such as log and metric fields.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub guardrails: Option<Vec<GuardrailInfo>>,
 
 	/// `metadata` contains values set by transformation metadata expressions.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2172,6 +2307,7 @@ impl ExecutorSerde {
 		exec.extauthz = ExtensionOrDirect::Direct(self.extauthz.as_ref());
 		exec.extproc = ExtensionOrDirect::Direct(self.extproc.as_ref());
 		exec.mcp_guardrails = ExtensionOrDirect::Direct(self.mcp_guardrails.as_ref());
+		exec.guardrails = self.guardrails.as_ref();
 		exec.metadata = ExtensionOrDirect::Direct(self.metadata.as_ref());
 		exec.mcp = self.mcp.as_ref();
 
@@ -2214,6 +2350,10 @@ pub fn full_example_executor() -> ExecutorSerde {
 			body_prefix: Some(BufferedBody::complete(Bytes::from(r#"{"ok": true}"#))),
 		}),
 		proxy: Some(ProxyContext {
+			error: Some(ErrorContext {
+				reason: "UpstreamFailure".to_string(),
+				message: "upstream call failed: connection refused".to_string(),
+			}),
 			bind: Some("bind".into()),
 			gateway: Some(ProxyGatewayContext {
 				namespace: "ns-1".into(),
@@ -2244,6 +2384,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			raw_port: 12345,
 			tls: Some(TlsInfo {
 				identity: None,
+				spiffe_id: None,
 				subject_alt_names: vec!["san".into()],
 				issuer: Default::default(),
 				subject: Default::default(),
@@ -2263,6 +2404,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 		destination: Some(DestinationContext {
 			address: "10.0.0.1".parse().unwrap(),
 			port: 8080,
+			hostname: Some("example.com".into()),
 		}),
 		jwt: Some(jwt::Claims {
 			inner: serde_json::Map::from_iter(vec![
@@ -2288,6 +2430,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			response_model: Some("gpt-4-turbo".into()),
 			provider: "fake-ai".into(),
 			input_tokens: Some(100),
+			provider_input_tokens: Some(100),
 			input_image_tokens: Some(60),
 			input_text_tokens: Some(40),
 			input_audio_tokens: Some(5),
@@ -2299,6 +2442,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			output_audio_tokens: Some(3),
 			reasoning_tokens: Some(30),
 			total_tokens: Some(150),
+			provider_total_tokens: Some(150),
 			service_tier: Some("default".into()),
 			first_token: None,
 			time_to_first_token: Some(chrono::Duration::milliseconds(123).into()),
@@ -2323,7 +2467,7 @@ pub fn full_example_executor() -> ExecutorSerde {
 			cost_status: None,
 		}),
 		mcp: Some(MCPInfo {
-			method_name: Some("tools/call".to_string()),
+			method_name: Some("tools/call".into()),
 			session_id: Some("session-123".to_string()),
 			tool: Some(MCPTool {
 				target: "my-mcp-server".to_string(),
@@ -2355,6 +2499,17 @@ pub fn full_example_executor() -> ExecutorSerde {
 		extauthz: Some(ExtAuthzDynamicMetadata::default()),
 		extproc: Some(ExtProcDynamicMetadata::default()),
 		mcp_guardrails: Some(McpGuardrailsDynamicMetadata::default()),
+		guardrails: Some(vec![GuardrailInfo {
+			phase: "request".into(),
+			guard: "bedrockGuardrails".into(),
+			action: "reject".into(),
+			detail: GuardDetail {
+				guardrail_id: Some("gr-abc123".into()),
+				guardrail_version: Some("1".into()),
+				action_reason: Some("Guardrail blocked.".into()),
+				assessments: vec![],
+			},
+		}]),
 		metadata: Some(TransformationMetadata::default()),
 	}
 }

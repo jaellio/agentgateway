@@ -19,10 +19,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::ClientCertVerifier;
 use rustls_pki_types::pem::{PemObject, SectionKind};
 use secrecy::SecretString;
+use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::control::caclient::CaClient;
+use crate::control::spiffe::SpiffeClient;
 use crate::http::auth::{BackendAuth, BackendAuthCredential, BackendAuthKind};
 use crate::http::authorization::RuleSet;
 use crate::http::backendtls::ResolvedBackendTLS;
@@ -42,6 +44,7 @@ use crate::types::{agent, backend, frontend};
 use crate::{apply, *};
 
 #[apply(schema_ser_schema!)]
+#[derive(Eq, PartialEq)]
 pub struct Bind {
 	pub key: BindKey,
 	pub address: SocketAddr,
@@ -51,7 +54,6 @@ pub struct Bind {
 	/// `standard` (default) binds the `address`; `internal` does not bind a socket and is only
 	/// reachable via in-process routing (e.g. CONNECT tunnel re-entry by other listeners).
 	pub mode: BindMode,
-	pub listeners: ListenerSet,
 }
 
 impl Bind {
@@ -59,6 +61,53 @@ impl Bind {
 	/// it handles CONNECT re-entry for any destination port that no other bind matches by port.
 	pub fn is_wildcard(&self) -> bool {
 		self.mode == BindMode::Internal && self.address.port() == 0
+	}
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BindSnapshot {
+	#[cfg_attr(feature = "schema", schemars(flatten))]
+	pub bind: Arc<Bind>,
+	pub listeners: Arc<ListenerSet>,
+}
+
+impl Serialize for BindSnapshot {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let mut snapshot = serializer.serialize_struct("BindSnapshot", 6)?;
+		snapshot.serialize_field("key", &self.key)?;
+		snapshot.serialize_field("address", &self.address)?;
+		snapshot.serialize_field("protocol", &self.protocol)?;
+		snapshot.serialize_field("tunnelProtocol", &self.tunnel_protocol)?;
+		snapshot.serialize_field("mode", &self.mode)?;
+		snapshot.serialize_field("listeners", &self.listeners)?;
+		snapshot.end()
+	}
+}
+
+impl BindSnapshot {
+	pub fn new(bind: Bind, listeners: ListenerSet) -> Self {
+		Self {
+			bind: Arc::new(bind),
+			listeners: Arc::new(listeners),
+		}
+	}
+}
+
+impl std::ops::Deref for BindSnapshot {
+	type Target = Bind;
+
+	fn deref(&self) -> &Self::Target {
+		&self.bind
+	}
+}
+
+impl std::ops::DerefMut for BindSnapshot {
+	fn deref_mut(&mut self) -> &mut Self::Target {
+		Arc::make_mut(&mut self.bind)
 	}
 }
 
@@ -177,7 +226,16 @@ pub struct ServerTLSConfig {
 enum ServerTlsCertificateSource {
 	Static,
 	DynamicCa,
-	IstioWorkload { mtls: bool, default_alpns: Alpns },
+	IstioWorkload {
+		mtls: bool,
+		default_alpns: Alpns,
+	},
+	Spiffe {
+		default_alpns: Alpns,
+		/// Federated trust domains (beyond the gateway's own) whose client SVIDs this listener
+		/// accepts; the local trust domain is always implicit.
+		accepted_trust_domains: Vec<String>,
+	},
 }
 
 impl Eq for ServerTLSConfig {}
@@ -334,12 +392,27 @@ impl ServerTLSConfig {
 		}
 	}
 
+	/// Serving identity sourced from the SPIFFE Workload API
+	pub fn spiffe(default_alpns: Alpns, accepted_trust_domains: Vec<String>) -> Self {
+		Self {
+			source: ServerTlsCertificateSource::Spiffe {
+				default_alpns,
+				accepted_trust_domains,
+			},
+			base_config: None,
+			inputs: None,
+			insecure_fallback_verifier: None,
+			per_profile_config: Arc::new(Default::default()),
+		}
+	}
+
 	/// config_for returns the appropriate config for the requested ALPN
 	/// If none is return, it means the certificates were invalid.
 	pub async fn config_for(
 		&self,
 		tls: Option<&frontend::TLS>,
 		ca: Option<&Arc<CaClient>>,
+		spiffe: Option<&Arc<SpiffeClient>>,
 	) -> anyhow::Result<Arc<ServerConfig>> {
 		if let ServerTlsCertificateSource::IstioWorkload {
 			mtls,
@@ -352,6 +425,18 @@ impl ServerTLSConfig {
 				.unwrap_or_else(|| default_alpns.clone());
 			let cert = ca.get_identity().await?;
 			return Ok(Arc::new(cert.server_config(alpns, *mtls)?));
+		}
+
+		if let ServerTlsCertificateSource::Spiffe {
+			default_alpns,
+			accepted_trust_domains,
+		} = &self.source
+		{
+			let spiffe = spiffe.ok_or_else(|| anyhow!("SPIFFE source is required for spiffe TLS"))?;
+			let alpns = tls
+				.and_then(|t| t.alpn.clone())
+				.unwrap_or_else(|| default_alpns.clone());
+			return Ok(spiffe.server_config(alpns, accepted_trust_domains.clone())?);
 		}
 
 		let inputs = match self.inputs.as_ref() {
@@ -418,7 +503,8 @@ impl ServerTLSConfig {
 					&inputs.dynamic_ca_cert_cache,
 				)?
 			},
-			ServerTlsCertificateSource::IstioWorkload { .. } => unreachable!(),
+			ServerTlsCertificateSource::IstioWorkload { .. }
+			| ServerTlsCertificateSource::Spiffe { .. } => unreachable!(),
 		};
 		let base = Arc::new(base);
 		writer.insert(key.clone(), Arc::clone(&base));
@@ -429,6 +515,7 @@ impl ServerTLSConfig {
 		if matches!(
 			self.source,
 			ServerTlsCertificateSource::IstioWorkload { mtls: true, .. }
+				| ServerTlsCertificateSource::Spiffe { .. }
 		) {
 			return false;
 		}
@@ -438,36 +525,38 @@ impl ServerTLSConfig {
 			.is_some_and(|inputs| inputs.allow_insecure_mtls)
 	}
 
-	pub fn include_src_identity_for_connection(&self, conn: &rustls::ServerConnection) -> bool {
+	pub fn include_src_identity_for_connection(
+		&self,
+		conn: &rustls::ServerConnection,
+	) -> Option<tls::PeerIdentityMode> {
+		// SPIFFE peers carry a raw SPIFFE ID that must not be reinterpreted as an Istio identity.
+		if matches!(self.source, ServerTlsCertificateSource::Spiffe { .. }) {
+			return Some(tls::PeerIdentityMode::Spiffe);
+		}
 		if matches!(
 			self.source,
 			ServerTlsCertificateSource::IstioWorkload { mtls: true, .. }
 		) {
-			return true;
+			return Some(tls::PeerIdentityMode::Istio);
 		}
 		if !self.allow_insecure_mtls() {
-			return true;
+			return Some(tls::PeerIdentityMode::Istio);
 		}
 
-		let Some(peer_certs) = conn.peer_certificates() else {
-			return false;
-		};
-		let Some((end_entity, intermediates)) = peer_certs.split_first() else {
-			return false;
-		};
+		let peer_certs = conn.peer_certificates()?;
+		let (end_entity, intermediates) = peer_certs.split_first()?;
 
-		let Some(verifier) = self.insecure_fallback_verifier.as_ref() else {
-			return false;
-		};
+		let verifier = self.insecure_fallback_verifier.as_ref()?;
 
 		let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
 			Ok(duration) => rustls::pki_types::UnixTime::since_unix_epoch(duration),
-			Err(_) => return false,
+			Err(_) => return None,
 		};
 
 		verifier
 			.verify_client_cert(end_entity, intermediates, now)
 			.is_ok()
+			.then_some(tls::PeerIdentityMode::Istio)
 	}
 
 	fn build_server_config(
@@ -478,7 +567,8 @@ impl ServerTLSConfig {
 		cipher_suites: &[crate::transport::tls::CipherSuite],
 		key_exchange_groups: &[crate::transport::tls::KeyExchangeGroup],
 	) -> anyhow::Result<(ServerConfig, Option<Arc<dyn ClientCertVerifier>>)> {
-		let provider = crate::transport::tls::provider_with_options(cipher_suites, key_exchange_groups);
+		let provider =
+			crate::transport::tls::provider_with_options_validated(cipher_suites, key_exchange_groups)?;
 
 		let versions = tls_versions_for_range(min_version, max_version)?;
 		let scb = ServerConfig::builder_with_provider(provider.clone())
@@ -562,7 +652,16 @@ impl serde::Serialize for ServerTLSConfig {
 		S: Serializer,
 	{
 		// TODO: store raw pem
-		serializer.serialize_none()
+		use serde::ser::SerializeStruct;
+		let source = match &self.source {
+			ServerTlsCertificateSource::Static => "Static",
+			ServerTlsCertificateSource::DynamicCa => "DynamicCa",
+			ServerTlsCertificateSource::IstioWorkload { .. } => "IstioWorkload",
+			ServerTlsCertificateSource::Spiffe { .. } => "SPIFFE",
+		};
+		let mut st = serializer.serialize_struct("ServerTLSConfig", 1)?;
+		st.serialize_field("certificateSource", source)?;
+		st.end()
 	}
 }
 
@@ -573,7 +672,13 @@ impl JsonSchema for ServerTLSConfig {
 	}
 
 	fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-		schemars::json_schema!({ "type": "null" })
+		// Serialize-only dump view: the cert material isn't stored, only the source
+		// discriminant is emitted. Typed as a plain string so the allowed values live
+		// solely in the `Serialize` impl above rather than being duplicated here.
+		schemars::json_schema!({
+			"type": "object",
+			"properties": { "certificateSource": { "type": "string" } }
+		})
 	}
 }
 
@@ -626,11 +731,12 @@ impl ListenerProtocol {
 		&self,
 		tls: Option<&frontend::TLS>,
 		ca: Option<&Arc<CaClient>>,
+		spiffe: Option<&Arc<SpiffeClient>>,
 	) -> Option<anyhow::Result<Arc<rustls::ServerConfig>>> {
 		match self {
-			ListenerProtocol::HTTPS(t) => Some(t.config_for(tls, ca).await),
+			ListenerProtocol::HTTPS(t) => Some(t.config_for(tls, ca, spiffe).await),
 			ListenerProtocol::TLS(t) => match t.as_ref() {
-				Some(t) => Some(t.config_for(tls, ca).await),
+				Some(t) => Some(t.config_for(tls, ca, spiffe).await),
 				None => None,
 			},
 			_ => None,
@@ -645,11 +751,14 @@ impl ListenerProtocol {
 		}
 	}
 
-	pub fn include_src_identity_for_connection(&self, conn: &rustls::ServerConnection) -> bool {
+	pub fn include_src_identity_for_connection(
+		&self,
+		conn: &rustls::ServerConnection,
+	) -> Option<tls::PeerIdentityMode> {
 		match self {
 			ListenerProtocol::HTTPS(t) => t.include_src_identity_for_connection(conn),
 			ListenerProtocol::TLS(Some(t)) => t.include_src_identity_for_connection(conn),
-			_ => true,
+			_ => Some(tls::PeerIdentityMode::Istio),
 		}
 	}
 }
@@ -736,16 +845,15 @@ pub type RouteKey = Strng;
 pub type RouteGroupKey = Strng;
 pub type RouteRuleName = Strng;
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub struct ModelRoute {
 	pub key: RouteKey,
 	pub name: Strng,
+	pub router_key: BackendKey,
 	pub kind: ModelRouteKind,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[apply(schema_ser_schema!)]
 pub enum ModelRouteKind {
 	Concrete(crate::llm::model_router::ModelRoute),
 	Virtual(crate::llm::model_router::VirtualModelRoute),
@@ -1039,7 +1147,11 @@ pub struct TCPRoute {
 pub struct TCPRouteBackendReference {
 	#[serde(default = "default_weight")]
 	pub weight: usize,
-	pub backend: SimpleBackendReference,
+	#[cfg_attr(
+		feature = "schema",
+		schemars(with = "crate::types::local::LocalTCPBackend")
+	)]
+	pub backend: BackendReference,
 	// Inline policies ("filters") of the route backend
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
@@ -1051,7 +1163,7 @@ pub struct TCPRouteBackendReference {
 pub struct TCPRouteBackend {
 	#[serde(default = "default_weight")]
 	pub weight: usize,
-	pub backend: SimpleBackendWithPolicies,
+	pub backend: BackendWithPolicies,
 	// Inline policies ("filters") of the route backend
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub inline_policies: Vec<BackendTrafficPolicy>,
@@ -1191,6 +1303,7 @@ pub enum PathRedirect {
 pub enum RouteBackendTarget {
 	Service { name: NamespacedHostname, port: u16 },
 	Backend(BackendKey),
+	InlineBackend(Target),
 	RouteGroup(RouteGroupKey),
 	Invalid,
 }
@@ -1200,6 +1313,7 @@ impl From<BackendReference> for RouteBackendTarget {
 		match value {
 			BackendReference::Service { name, port } => Self::Service { name, port },
 			BackendReference::Backend(key) => Self::Backend(key),
+			BackendReference::InlineBackend(target) => Self::InlineBackend(target),
 			BackendReference::Invalid => Self::Invalid,
 		}
 	}
@@ -1213,6 +1327,7 @@ impl RouteBackendTarget {
 				port: *port,
 			}),
 			Self::Backend(key) => Some(BackendReference::Backend(key.clone())),
+			Self::InlineBackend(target) => Some(BackendReference::InlineBackend(target.clone())),
 			Self::Invalid => Some(BackendReference::Invalid),
 			Self::RouteGroup(_) => None,
 		}
@@ -1279,8 +1394,14 @@ pub enum Backend {
 	LLMRouter(ResourceName, Arc<crate::llm::model_router::ModelRouter>),
 	#[serde(rename = "aws", serialize_with = "serialize_backend_tuple")]
 	Aws(ResourceName, crate::aws::AwsBackendConfig),
+	/// The second field, when set, is a CEL expression evaluated against the
+	/// request (with any ext_proc/extAuthz dynamic metadata already attached)
+	/// to compute the dial target. The expression and any policy that supplies
+	/// its dynamic metadata are trusted to select that target. This replaces the
+	/// default behavior of reading the request's current :authority/URI (see
+	/// target_from_request).
 	#[serde(serialize_with = "serialize_backend_tuple")]
-	Dynamic(ResourceName, ()),
+	Dynamic(ResourceName, Option<Arc<crate::cel::Expression>>),
 	/// In-process admin service backend. This is only valid for HTTP routes.
 	#[serde(serialize_with = "serialize_backend_tuple")]
 	Internal(ResourceName, InternalBackend),
@@ -1316,6 +1437,7 @@ pub fn serialize_backend_tuple<S: Serializer, T: serde::Serialize>(
 pub enum BackendReference {
 	Service { name: NamespacedHostname, port: u16 },
 	Backend(BackendKey),
+	InlineBackend(Target),
 	Invalid,
 }
 
@@ -1725,6 +1847,11 @@ pub struct McpBackend {
 	#[serde(with = "crate::serdes::serde_dur")]
 	#[cfg_attr(feature = "schema", schemars(with = "String"))]
 	pub session_idle_ttl: Duration,
+	/// When true, reject MCP requests whose Host/Origin is not localhost
+	/// (`localhost`, `127.0.0.1`, `[::1]`, with optional port). Off by default:
+	/// agentgateway is typically not a browser-facing localhost MCP server.
+	#[serde(default, skip_serializing_if = "crate::serdes::is_default")]
+	pub dns_rebinding_protection: bool,
 }
 
 impl McpBackend {
@@ -1822,7 +1949,7 @@ pub struct OpenAPITarget {
 	pub schema: Arc<OpenAPI>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[cfg_attr(
 	feature = "schema",
@@ -2647,6 +2774,8 @@ pub enum FrontendPolicy {
 	#[serde(rename = "tcp")]
 	TCP(frontend::TCP),
 	NetworkAuthorization(frontend::NetworkAuthorization),
+	NetworkExtAuthz(Arc<ext_authz::ExtAuthz>),
+	SubstrateEgress(crate::http::substrate::SubstrateEgress),
 	Proxy(frontend::Proxy),
 	Connect(frontend::Connect),
 	AccessLog(frontend::LoggingPolicy),
@@ -2666,11 +2795,13 @@ pub enum TrafficPolicy {
 	LocalRateLimit(RequestPolicy<Vec<crate::http::localratelimit::RateLimit>>),
 	RemoteRateLimit(RequestPolicy<remoteratelimit::RemoteRateLimit>),
 	ExtAuthz(RequestPolicy<ext_authz::ExtAuthz>),
+	SubstrateIngress(RequestPolicy<crate::http::substrate::SubstrateIngress>),
 	ExtProc(RequestPolicy<ext_proc::ExtProc>),
 	JwtAuth(RequestPolicy<JwtAuthentication>),
 	Oidc(RequestPolicy<crate::http::oidc::OidcPolicy>),
 	BasicAuth(RequestPolicy<crate::http::basicauth::BasicAuthentication>),
 	APIKey(RequestPolicy<crate::http::apikey::APIKeyAuthentication>),
+	Budget(RequestPolicy<crate::http::budget::BudgetPolicy>),
 	Transformation(RequestPolicy<crate::http::transformation_cel::Transformation>),
 	Csrf(RequestPolicy<crate::http::csrf::Csrf>),
 
@@ -2872,7 +3003,8 @@ pub struct LocalMcpAuthentication {
 	/// Expected token issuer, matched against the JWT `iss` claim.
 	pub issuer: String,
 	/// Accepted token audiences, matched against the JWT `aud` claim.
-	pub audiences: Vec<String>,
+	/// If unset, audience validation is disabled.
+	pub audiences: Option<Vec<String>>,
 	/// Identity provider type used to derive MCP authorization metadata and default JWKS URLs.
 	pub provider: Option<McpIDP>,
 	/// Protected resource metadata returned to MCP clients.
@@ -2963,8 +3095,9 @@ impl LocalMcpAuthentication {
 		Ok(http::jwt::LocalJwtConfig::Single {
 			mode: self.mode.into(),
 			location: self.authorization_location.clone(),
+			preserve_token: false,
 			issuer: self.issuer.clone(),
-			audiences: Some(self.audiences.clone()),
+			audiences: self.audiences.clone(),
 			jwks,
 			jwt_validation_options: self.jwt_validation_options.clone(),
 		})
@@ -2979,7 +3112,7 @@ impl LocalMcpAuthentication {
 		let jwt = jwt_cfg.try_into(resources).await?;
 		Ok(McpAuthentication {
 			issuer: self.issuer.clone(),
-			audiences: self.audiences.clone(),
+			audiences: self.audiences.clone().unwrap_or_default(),
 			provider: self.provider.clone(),
 			resource_metadata: self.resource_metadata.clone(),
 			jwt_validator: Arc::new(jwt),
@@ -3079,6 +3212,7 @@ impl Target {
 }
 
 #[apply(schema!)]
+#[derive(Hash, PartialEq, Eq)]
 pub struct KeepaliveConfig {
 	/// Enable TCP keepalive probes on backend connections. Defaults to true.
 	#[serde(default = "defaults::always_true")]
@@ -3129,6 +3263,16 @@ pub mod defaults {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(feature = "fips")]
+	fn fips_test_certificate() -> (Vec<u8>, Vec<u8>) {
+		let key = rcgen::KeyPair::generate().expect("generate test key");
+		let mut params =
+			rcgen::CertificateParams::new(vec!["fips.example.com".to_string()]).expect("valid test name");
+		params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+		let cert = params.self_signed(&key).expect("generate test certificate");
+		(cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+	}
 
 	fn route_match(path: &'static str) -> RouteMatch {
 		RouteMatch {
@@ -3228,7 +3372,7 @@ mod tests {
 		.expect("build dynamic CA TLS config");
 
 		let base = tls_config
-			.config_for(None, None)
+			.config_for(None, None, None)
 			.await
 			.expect("base config");
 		assert_eq!(base.alpn_protocols, vec![b"h2".to_vec()]);
@@ -3238,12 +3382,65 @@ mod tests {
 			..Default::default()
 		};
 		let profiled = tls_config
-			.config_for(Some(&frontend_tls), None)
+			.config_for(Some(&frontend_tls), None, None)
 			.await
 			.expect("profiled config");
 
 		assert!(!Arc::ptr_eq(&base, &profiled));
 		assert_eq!(profiled.alpn_protocols, vec![b"http/1.1".to_vec()]);
+	}
+
+	#[cfg(feature = "fips")]
+	#[test]
+	fn fips_config_static_frontend_tls_rejects_non_approved_cipher_suite() {
+		use crate::transport::tls::CipherSuite;
+
+		let (cert, key) = fips_test_certificate();
+		let result = ServerTLSConfig::from_pem_with_profile(
+			cert,
+			key,
+			None,
+			vec![],
+			None,
+			None,
+			Some(vec![CipherSuite::TLS_CHACHA20_POLY1305_SHA256]),
+			None,
+			false,
+		);
+		let err = match result {
+			Ok(_) => panic!("non-approved frontend cipher suite was accepted"),
+			Err(err) => err,
+		};
+		assert!(
+			err.to_string().contains("TLS_CHACHA20_POLY1305_SHA256"),
+			"error should name the configured cipher suite, got: {err}"
+		);
+	}
+
+	#[cfg(feature = "fips")]
+	#[test]
+	fn fips_config_dynamic_ca_tls_rejects_non_approved_key_exchange_group() {
+		use crate::transport::tls::KeyExchangeGroup;
+
+		let (cert, key) = fips_test_certificate();
+		let result = ServerTLSConfig::dynamic_ca_with_profile(
+			cert,
+			key,
+			vec![],
+			None,
+			None,
+			None,
+			Some(vec![KeyExchangeGroup::X25519]),
+			Default::default(),
+		);
+		let err = match result {
+			Ok(_) => panic!("non-approved dynamic-CA key exchange group was accepted"),
+			Err(err) => err,
+		};
+		assert!(
+			err.to_string().contains("X25519"),
+			"error should name the configured key exchange group, got: {err}"
+		);
 	}
 
 	#[test]
@@ -3533,6 +3730,24 @@ resourceMetadata:
 		assert_eq!(auth.client_id.as_deref(), Some("client-id-guid"));
 		assert!(auth.client_secret.is_some());
 		assert!(auth.as_jwt().is_ok());
+	}
+
+	#[test]
+	fn test_local_mcp_authentication_without_audiences() {
+		let yaml = r#"
+issuer: "https://example.com"
+jwks: '{"keys":[]}'
+resourceMetadata: {}
+"#;
+		let auth: LocalMcpAuthentication = serde_yaml::from_str(yaml).unwrap();
+		assert_eq!(auth.audiences, None);
+
+		match auth.as_jwt().unwrap() {
+			http::jwt::LocalJwtConfig::Single { audiences, .. } => {
+				assert_eq!(audiences, None);
+			},
+			_ => panic!("Expected LocalJwtConfig::Single"),
+		}
 	}
 
 	#[test]

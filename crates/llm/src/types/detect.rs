@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::webhook::ResponseChoice;
 use crate::{
-	AIError, InputFormat, LLMRequest, LLMRequestParams, LLMResponse, RequestType, ResponseType,
-	SimpleChatCompletionMessage, StreamingUsageGuard, json, parse,
+	AIError, ContentScope, InputFormat, LLMRequest, LLMRequestParams, LLMResponse, RequestType,
+	ResponseType, SimpleChatCompletionMessage, StreamingUsageGuard, json, parse,
 };
 
 fn lookup<'a, T, const C: usize>(
@@ -58,6 +58,10 @@ impl Request {
 impl RequestType for Request {
 	fn supports_model(&self) -> bool {
 		false
+	}
+
+	fn body_is_json(&self) -> bool {
+		matches!(self, Self::Json(_))
 	}
 
 	fn to_value(&self) -> serde_json::Result<serde_json::Value> {
@@ -118,7 +122,7 @@ impl RequestType for Request {
 		unimplemented!("set_messages is used for prompt guard; prompt guard is disabled for detect.")
 	}
 
-	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(&mut String)) {
+	fn visit_text_mut(&mut self, _f: &mut dyn FnMut(ContentScope, &mut String)) {
 		unimplemented!("visit_text_mut is used for prompt guard; prompt guard is disabled for detect.")
 	}
 }
@@ -137,14 +141,22 @@ pub fn amend_request_info(llm_info: &mut LLMRequest, path: &str) {
 }
 
 pub fn extract_model_from_path(path: &str) -> Option<Strng> {
-	let model = if path.ends_with(":streamRawPredict")
-		|| path.ends_with(":rawPredict")
-		|| path.ends_with(":streamGenerateContent")
-		|| path.ends_with(":generateContent")
-	{
+	let model = if path.ends_with(":streamRawPredict") || path.ends_with(":rawPredict") {
 		path
 			.split_once("/publishers/")
 			.and_then(|(_, rest)| rest.split_once("/models/"))
+			.and_then(|(_, rest)| rest.split_once(':').map(|(model, _)| model))
+	} else if path.ends_with(":streamGenerateContent")
+		|| path.ends_with(":generateContent")
+		|| path.ends_with(":countTokens")
+	{
+		// Vertex nests models under publishers/{publisher}/models/; the Gemini API uses a
+		// bare /v1beta/models/{model}:suffix with no publisher segment.
+		let scoped = path
+			.split_once("/publishers/")
+			.map_or(path, |(_, rest)| rest);
+		scoped
+			.split_once("/models/")
 			.and_then(|(_, rest)| rest.split_once(':').map(|(model, _)| model))
 	} else if path.ends_with("/invoke-with-response-stream")
 		|| path.ends_with("/invoke")
@@ -157,7 +169,12 @@ pub fn extract_model_from_path(path: &str) -> Option<Strng> {
 	} else {
 		None
 	};
-	model.map(|model| strng::new(percent_decode_str(model).decode_utf8_lossy()))
+	// Every shape above spans `/`, and the result is interpolated into upstream paths. Percent
+	// decoding is what makes this load-bearing: `models/a%2F..%2F..:generateContent` matches an
+	// `[^/]+` route regex, so the traversal only appears after this decode.
+	model
+		.map(|model| strng::new(percent_decode_str(model).decode_utf8_lossy()))
+		.filter(|model| crate::model_path::is_safe_resource_name(model))
 }
 
 fn strip_bedrock_model_suffix(rest: &str) -> Option<&str> {
@@ -292,6 +309,72 @@ mod tests {
 	}
 
 	#[test]
+	fn extract_model_from_path_handles_bare_gemini_api_paths() {
+		assert_eq!(
+			extract_model_from_path("/v1beta/models/gemini-2.5-flash:generateContent").as_deref(),
+			Some("gemini-2.5-flash")
+		);
+		assert_eq!(
+			extract_model_from_path("/v1beta/models/gemini-2.5-flash:streamGenerateContent").as_deref(),
+			Some("gemini-2.5-flash")
+		);
+		assert_eq!(
+			extract_model_from_path("/v1beta/models/gemini-2.5-flash:countTokens").as_deref(),
+			Some("gemini-2.5-flash")
+		);
+	}
+
+	#[test]
+	fn extract_model_from_path_handles_vertex_count_tokens() {
+		assert_eq!(
+			extract_model_from_path(
+				"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash:countTokens"
+			)
+			.as_deref(),
+			Some("gemini-2.5-flash")
+		);
+	}
+
+	#[rstest::rstest]
+	#[case::vertex_publisher(
+		"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash/../../../../locations/global/endpoints/openapi/chat/completions:generateContent"
+	)]
+	#[case::vertex_publisher_encoded(
+		"/v1/projects/p/locations/global/publishers/google/models/gemini-2.5-flash%2F..%2F..%2Fendpoints%2Fopenapi%2Fchat%2Fcompletions:generateContent"
+	)]
+	#[case::vertex_raw_predict(
+		"/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5%2F..%2F..%2Fendpoints%2Fopenapi%2Fchat%2Fcompletions:rawPredict"
+	)]
+	#[case::bare_gemini("/v1beta/models/gemini-2.5-flash/../../foo:generateContent")]
+	#[case::bare_gemini_encoded(
+		"/v1beta/models/gemini-2.5-flash%2F..%2F..%2Ffoo:streamGenerateContent"
+	)]
+	#[case::double_encoded("/v1beta/models/gemini-2.5-flash%252F..%252F..:countTokens")]
+	#[case::backslash("/v1beta/models/gemini-2.5-flash%5C..%5C..:generateContent")]
+	#[case::empty("/v1beta/models/:generateContent")]
+	#[case::whitespace_only("/v1beta/models/%20%20:generateContent")]
+	#[case::dot_dot_segment("/v1beta/models/..:generateContent")]
+	fn extract_model_from_path_rejects_unsafe_model_segments(#[case] path: &str) {
+		// A `/` here reaches the upstream path builders, which interpolate into a single-segment
+		// slot; `%2F` is the interesting case because it still matches an `[^/]+` route regex.
+		assert_eq!(extract_model_from_path(path), None, "{path}");
+	}
+
+	#[test]
+	fn extract_model_from_path_keeps_resource_style_names() {
+		// The model router percent-encodes `/` in a virtual-model target so it stays one segment
+		// (`rewrite_path_model`); decoding it back must not look like traversal.
+		assert_eq!(
+			extract_model_from_path("/v1beta/models/tunedModels%2Fabc:generateContent").as_deref(),
+			Some("tunedModels/abc")
+		);
+		assert_eq!(
+			extract_model_from_path("/v1beta/models/models%2Fgemini-2.5-flash:countTokens").as_deref(),
+			Some("models/gemini-2.5-flash")
+		);
+	}
+
+	#[test]
 	fn to_llm_response_extracts_gemini_native_usage() {
 		let resp = Response::Json(serde_json::json!({
 			"candidates": [{
@@ -314,6 +397,37 @@ mod tests {
 		assert_eq!(llm_response.input_tokens, Some(8));
 		assert_eq!(llm_response.output_tokens, Some(14));
 		assert_eq!(llm_response.total_tokens, Some(22));
+	}
+
+	#[test]
+	fn to_llm_response_extracts_gemini_cloud_code_usage() {
+		// Cloud Code (cloudcode-pa.googleapis.com) serves generateContent with the
+		// whole Gemini payload nested under a `response` key, so the unwrapped
+		// `usageMetadata` paths miss and usage is silently dropped.
+		let resp = Response::Json(serde_json::json!({
+			"response": {
+				"candidates": [{
+					"content": {
+						"role": "model",
+						"parts": [{"text": "Hello!"}]
+					}
+				}],
+				"usageMetadata": {
+					"promptTokenCount": 30460,
+					"candidatesTokenCount": 3,
+					"totalTokenCount": 30550,
+					"thoughtsTokenCount": 87
+				},
+				"modelVersion": "gemini-3.6-flash"
+			},
+			"traceId": "fb9dce3e019159b5"
+		}));
+
+		let llm_response = resp.to_llm_response(crate::LogContentFields::default());
+
+		assert_eq!(llm_response.input_tokens, Some(30460));
+		assert_eq!(llm_response.output_tokens, Some(3));
+		assert_eq!(llm_response.total_tokens, Some(30550));
 	}
 }
 
@@ -349,7 +463,7 @@ mod lookups {
 	pub const MAX_TOKENS: [&[&str]; 2] = [&["max_completion_tokens"], &["max_tokens"]];
 	pub const ENCODING_FORMAT: [&[&str]; 1] = [&["encoding_format"]];
 	pub const DIMENSIONS: [&[&str]; 1] = [&["dimensions"]];
-	pub const USAGE_INPUT_TOKENS: [&[&str]; 6] = [
+	pub const USAGE_INPUT_TOKENS: [&[&str]; 7] = [
 		&["usage", "input_tokens"],
 		// Responses streaming
 		&["response", "usage", "input_tokens"],
@@ -360,8 +474,11 @@ mod lookups {
 		&["metadata", "usage", "inputTokens"],
 		// Gemini generateContent
 		&["usageMetadata", "promptTokenCount"],
+		// Gemini generateContent via Cloud Code, which wraps the payload in a
+		// `response` envelope
+		&["response", "usageMetadata", "promptTokenCount"],
 	];
-	pub const USAGE_OUTPUT_TOKENS: [&[&str]; 6] = [
+	pub const USAGE_OUTPUT_TOKENS: [&[&str]; 7] = [
 		&["usage", "output_tokens"],
 		// Responses streaming
 		&["response", "usage", "output_tokens"],
@@ -372,13 +489,17 @@ mod lookups {
 		&["metadata", "usage", "outputTokens"],
 		// Gemini generateContent
 		&["usageMetadata", "candidatesTokenCount"],
+		// Gemini generateContent via Cloud Code
+		&["response", "usageMetadata", "candidatesTokenCount"],
 	];
-	pub const USAGE_TOTAL_TOKENS: [&[&str]; 3] = [
+	pub const USAGE_TOTAL_TOKENS: [&[&str]; 4] = [
 		&["usage", "total_tokens"],
 		// Bedrock converse
 		&["usage", "totalTokens"],
 		// Gemini generateContent
 		&["usageMetadata", "totalTokenCount"],
+		// Gemini generateContent via Cloud Code
+		&["response", "usageMetadata", "totalTokenCount"],
 	];
 	pub const INPUT_IMAGE_TOKENS: [&[&str]; 1] = [&["usage", "input_tokens_details", "image_tokens"]];
 	pub const INPUT_TEXT_TOKENS: [&[&str]; 1] = [&["usage", "input_tokens_details", "text_tokens"]];

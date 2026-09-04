@@ -9,6 +9,10 @@ use tracing::debug;
 
 use crate::{StreamingUsageGuard, logged_response_parsing, parse, types};
 
+#[cfg(test)]
+#[path = "completions_tests.rs"]
+mod tests;
+
 /// Parse a Google error response, handling both single object and array-wrapped formats.
 /// Google's OpenAI-compatible endpoints consistently return `[{"error": {...}}]`
 /// rather than `{"error": {...}}` when using the Vertex AI shim.
@@ -66,59 +70,15 @@ pub fn translate_google_error(bytes: &Bytes) -> Result<Bytes, crate::AIError> {
 pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
 	let raw = url.strip_prefix("data:")?;
 	let (meta, data) = raw.split_once(',')?;
-	let (media_type, encoding) = meta.split_once(';')?;
-	if !encoding.eq_ignore_ascii_case("base64") {
+	// RFC 2397 allows media-type parameters before the encoding marker:
+	// data:<mediatype>[;param=value]*;base64,<data>
+	let idx = meta.len().checked_sub(";base64".len())?;
+	if !meta.get(idx..)?.eq_ignore_ascii_case(";base64") {
 		return None;
 	}
+	// Parameters such as charset are not part of the media type.
+	let media_type = meta.get(..idx)?.split(';').next().unwrap_or_default();
 	Some((media_type, data))
-}
-
-pub(crate) fn extract_system_text(
-	msg: &types::completions::typed::RequestMessage,
-) -> Option<String> {
-	fn normalize_text(text: &str) -> Option<String> {
-		if text.trim().is_empty() {
-			None
-		} else {
-			Some(text.to_string())
-		}
-	}
-
-	match msg {
-		types::completions::typed::RequestMessage::System(system) => match &system.content {
-			types::completions::typed::RequestSystemMessageContent::Text(text) => normalize_text(text),
-			types::completions::typed::RequestSystemMessageContent::Array(parts) => {
-				let text = parts
-					.iter()
-					.map(|part| match part {
-						types::completions::typed::RequestSystemMessageContentPart::Text(text) => {
-							text.text.as_str()
-						},
-					})
-					.filter(|text| !text.trim().is_empty())
-					.collect::<Vec<_>>()
-					.join("\n");
-				normalize_text(&text)
-			},
-		},
-		types::completions::typed::RequestMessage::Developer(developer) => match &developer.content {
-			types::completions::typed::RequestDeveloperMessageContent::Text(text) => normalize_text(text),
-			types::completions::typed::RequestDeveloperMessageContent::Array(parts) => {
-				let text = parts
-					.iter()
-					.map(|part| match part {
-						types::completions::typed::RequestDeveloperMessageContentPart::Text(text) => {
-							text.text.as_str()
-						},
-					})
-					.filter(|text| !text.trim().is_empty())
-					.collect::<Vec<_>>()
-					.join("\n");
-				normalize_text(&text)
-			},
-		},
-		_ => None,
-	}
 }
 
 pub mod from_messages {
@@ -158,7 +118,26 @@ pub mod from_messages {
 		Ok(Box::new(anthropic))
 	}
 
-	fn translate_response_internal(
+	/// First string among the candidate extension values, in precedence order.
+	/// Integers (stop token ids) and empty strings are not stop sequences.
+	pub(crate) fn stop_sequence_from_fields<'a>(
+		candidates: impl IntoIterator<Item = Option<&'a Value>>,
+	) -> Option<String> {
+		candidates
+			.into_iter()
+			.flatten()
+			.filter_map(|v| v.as_str())
+			.find(|s| !s.is_empty())
+			.map(str::to_owned)
+	}
+
+	/// The stop sequence an engine reports on a buffered or streamed choice, if
+	/// any: vLLM uses `stop_reason`; SGLang uses `matched_stop`.
+	pub(crate) fn choice_stop_sequence(rest: &Value) -> Option<String> {
+		stop_sequence_from_fields([rest.get("stop_reason"), rest.get("matched_stop")])
+	}
+
+	pub(crate) fn translate_response_internal(
 		resp: completions::Response,
 	) -> Result<messages::MessagesResponse, AIError> {
 		let completions::Response {
@@ -186,8 +165,7 @@ pub mod from_messages {
 		if let Some(tool_calls) = choice.message.tool_calls {
 			content.extend(tool_calls.into_iter().filter_map(|tc| match tc {
 				completions::MessageToolCalls::Function(f) => {
-					let input =
-						serde_json::from_str::<serde_json::Value>(&f.function.arguments).unwrap_or_default();
+					let input = crate::conversion::tool_arguments_to_input(&f.function.arguments);
 					Some(messages::ContentBlock::ToolUse {
 						id: f.id,
 						name: f.function.name,
@@ -199,16 +177,23 @@ pub mod from_messages {
 			}));
 		}
 
-		let stop_reason = choice
-			.finish_reason
-			.map(|r| match r {
-				completions::FinishReason::Stop => messages::StopReason::EndTurn,
-				completions::FinishReason::Length => messages::StopReason::MaxTokens,
-				completions::FinishReason::ToolCalls => messages::StopReason::ToolUse,
-				completions::FinishReason::ContentFilter => messages::StopReason::EndTurn,
-				completions::FinishReason::FunctionCall => messages::StopReason::ToolUse,
-			})
-			.unwrap_or(messages::StopReason::EndTurn);
+		let (mut stop_reason, may_have_stop_sequence) = match choice.finish_reason {
+			Some(completions::FinishReason::Stop) => (messages::StopReason::EndTurn, true),
+			Some(completions::FinishReason::Length) => (messages::StopReason::MaxTokens, false),
+			Some(completions::FinishReason::ToolCalls) => (messages::StopReason::ToolUse, false),
+			Some(completions::FinishReason::ContentFilter) => (messages::StopReason::EndTurn, false),
+			Some(completions::FinishReason::FunctionCall) => (messages::StopReason::ToolUse, false),
+			None => (messages::StopReason::EndTurn, false),
+		};
+		// When the engine names the stop sequence that ended generation, the
+		// Messages contract is `stop_reason: "stop_sequence"` plus the matched
+		// string — not `end_turn`, which clients read as "the model finished".
+		let stop_sequence = may_have_stop_sequence
+			.then(|| choice_stop_sequence(&choice.rest))
+			.flatten();
+		if stop_sequence.is_some() {
+			stop_reason = messages::StopReason::StopSequence;
+		}
 
 		let cache_creation_input_tokens = usage.as_ref().and_then(|u| {
 			u.prompt_tokens_details
@@ -230,7 +215,7 @@ pub mod from_messages {
 			role: messages::Role::Assistant,
 			model,
 			stop_reason: Some(stop_reason),
-			stop_sequence: None,
+			stop_sequence,
 			usage: messages::Usage {
 				input_tokens: usage
 					.as_ref()
@@ -287,6 +272,7 @@ pub mod from_messages {
 			open_tool_blocks: HashSet<u32>,
 			pending_tool_calls: HashMap<u32, PendingToolCall>,
 			pending_stop_reason: Option<messages::StopReason>,
+			pending_stop_sequence: Option<String>,
 			pending_usage: Option<completions::Usage>,
 		}
 
@@ -464,7 +450,7 @@ pub mod from_messages {
 				messages::MessagesStreamEvent::MessageDelta {
 					delta: messages::MessageDelta {
 						stop_reason: Some(stop_reason),
-						stop_sequence: None,
+						stop_sequence: state.pending_stop_sequence.take(),
 					},
 					usage: messages::MessageDeltaUsage {
 						input_tokens: Some(input_tokens),
@@ -512,6 +498,7 @@ pub mod from_messages {
 		>(b, buffer_limit, move |evt| {
 			let mut events: Vec<(&'static str, messages::MessagesStreamEvent)> = Vec::new();
 			match evt {
+				SseJsonEvent::Eof | SseJsonEvent::Error => return events,
 				SseJsonEvent::Done => {
 					flush_message_end(&mut state, &mut events, &log, true, log_content.tool_calls);
 					return events;
@@ -630,13 +617,21 @@ pub mod from_messages {
 						}
 
 						if let Some(finish_reason) = &choice.finish_reason {
-							let stop_reason = match finish_reason {
+							let mut stop_reason = match finish_reason {
 								completions::FinishReason::Stop => messages::StopReason::EndTurn,
 								completions::FinishReason::Length => messages::StopReason::MaxTokens,
 								completions::FinishReason::ToolCalls => messages::StopReason::ToolUse,
 								completions::FinishReason::ContentFilter => messages::StopReason::Refusal,
 								completions::FinishReason::FunctionCall => messages::StopReason::ToolUse,
 							};
+							// Same contract as the buffered path: a named stop sequence is
+							// `stop_sequence`, not `end_turn`.
+							if stop_reason == messages::StopReason::EndTurn
+								&& let Some(seq) = choice_stop_sequence(&choice.rest)
+							{
+								stop_reason = messages::StopReason::StopSequence;
+								state.pending_stop_sequence = Some(seq);
+							}
 							state.pending_stop_reason = Some(stop_reason);
 						}
 					}

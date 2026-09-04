@@ -5,7 +5,7 @@ use ::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use anyhow::anyhow;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::form_urlencoded;
 
 use super::{
@@ -21,6 +21,7 @@ use crate::http::{self, Body};
 use crate::json;
 use crate::proxy::ProxyError;
 use crate::proxy::httpproxy::PolicyClient;
+use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 use crate::types::agent::{BackendTrafficPolicy, SimpleBackendReference};
 
 /// Default token-endpoint timeout, overridable by backend request-timeout policy
@@ -211,6 +212,7 @@ pub(super) async fn request_token(
 		.insert(BackendRequestTimeout(DEFAULT_TOKEN_ENDPOINT_TIMEOUT));
 
 	let resp = client
+		.with_outbound(OutboundCallKind::Policy, OutboundCallSubtype::Oidc)
 		.call_reference_with_policies(req, spec.target, spec.policies)
 		.await
 		.map_err(|e| FetchError::Upstream(anyhow!("token exchange request failed: {e}")))?;
@@ -241,7 +243,12 @@ fn classify_token_endpoint_error(status: StatusCode, body: String) -> FetchError
 			source: detailed,
 		}
 	} else {
-		debug!(%status, error = %detailed, "oauth token exchange returned non-success status");
+		// Only authorization server failures warrant a warning.
+		if status.is_server_error() {
+			warn!(%status, error = %detailed, "oauth token exchange returned non-success status");
+		} else {
+			debug!(%status, error = %detailed, "oauth token exchange returned non-success status");
+		}
 		FetchError::Upstream(anyhow!("token exchange returned status {status}"))
 	}
 }

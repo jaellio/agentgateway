@@ -327,6 +327,11 @@ type CustomProviderSettings struct {
 	// +optional
 	BackendRef *LocalBackendObjectReference `json:"backendRef,omitempty"`
 
+	// Provider identity used for cost-catalog lookup and telemetry.
+	// Defaults to "custom" when unset.
+	// +optional
+	ProviderOverride *ShortString `json:"providerOverride,omitempty"`
+
 	// Provider-native API formats this provider supports.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=6
@@ -593,8 +598,7 @@ type MCPBackend struct {
 	// +listType=map
 	// +listMapKey=name
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=32
-	// +kubebuilder:validation:XValidation:message="target names must be unique",rule="self.all(t1, self.exists_one(t2, t1.name == t2.name))"
+	// +kubebuilder:validation:MaxItems=128
 	// +required
 	Targets []McpTargetSelector `json:"targets"`
 

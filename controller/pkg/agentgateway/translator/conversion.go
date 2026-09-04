@@ -720,11 +720,9 @@ func ToInternalParentReference(p gwv1.ParentReference, localNamespace string, al
 	}
 	return utils.TypedNamespacedName{
 		Kind: ref.Kind,
-		NamespacedName: types.NamespacedName{
-			Name: string(p.Name),
-			// Unset namespace means "same namespace"
-			Namespace: defaultString(p.Namespace, localNamespace),
-		},
+		Name: string(p.Name),
+		// Unset namespace means "same namespace"
+		Namespace: defaultString(p.Namespace, localNamespace),
 	}, nil
 }
 
@@ -957,6 +955,10 @@ type RouteParentReference struct {
 	ParentSection   gwv1.SectionName
 	Accepted        bool
 	ParentGateway   types.NamespacedName
+	// Model-serving metadata populated when an AgentgatewayModel attaches to an
+	// HTTPRoute rule. The existing model conversion still uses the resolved
+	// Gateway listeners, while this key links it to the translated route backend.
+	ModelRouterKey string
 }
 
 // FilteredReferences filters out references that are not accepted by the Parent.
@@ -1226,10 +1228,28 @@ var dummyTls = &TLSInfo{
 const (
 	gatewayTLSTerminateModeKey          = "gateway.istio.io/tls-terminate-mode"
 	agentgatewayTLSCertificateSourceKey = "agentgateway.dev/tls-certificate-source"
+	// Comma-separated federated trust domains accepted for inbound client SVIDs. Only valid on a
+	// listener whose certificate source is SPIFFE; the local trust domain is always implicit.
+	agentgatewaySpiffeAcceptedTrustDomainsKey = "agentgateway.dev/spiffe-accepted-trust-domains"
 )
 
+// parseAcceptedTrustDomains splits a comma-separated trust-domain list, trimming whitespace and
+// dropping empty entries. Order is preserved; the dataplane tolerates duplicates.
+func parseAcceptedTrustDomains(csv string) []string {
+	if csv == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(csv, ",") {
+		if td := strings.TrimSpace(part); td != "" {
+			out = append(out, td)
+		}
+	}
+	return out
+}
+
 func validateTLS(certInfo *TLSInfo) *ConfigError {
-	if certInfo.IstioWorkloadCert {
+	if certInfo.IstioWorkloadCert || certInfo.Spiffe {
 		return nil
 	}
 	if _, err := tls.X509KeyPair(certInfo.Cert, certInfo.Key); err != nil {
@@ -1327,7 +1347,37 @@ func buildTLS(
 	switch mode {
 	case gwv1.TLSModeTerminate:
 		if tls.Options != nil {
-			switch tls.Options[gatewayTLSTerminateModeKey] {
+			terminateMode := tls.Options[gatewayTLSTerminateModeKey]
+			if tls.Options[agentgatewayTLSCertificateSourceKey] == "SPIFFE" {
+				if terminateMode != "" {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLS,
+						Message: fmt.Sprintf("TLS certificate source SPIFFE cannot be combined with the %s termination mode", terminateMode),
+					}
+				} else if gatewayTLS != nil && gatewayTLS.Validation != nil && len(gatewayTLS.Validation.CACertificateRefs) > 0 {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLSCA,
+						Message: "GatewayTLSConfig validation caCertificateRefs cannot be configured with SPIFFE TLS certificate source",
+					}
+				} else if len(tls.CertificateRefs) > 0 {
+					return dummyTls, &ConfigError{
+						Reason:  InvalidTLS,
+						Message: "certificateRefs cannot be configured with SPIFFE TLS certificate source",
+					}
+				}
+				return &TLSInfo{
+					Spiffe:                     true,
+					SpiffeAcceptedTrustDomains: parseAcceptedTrustDomains(string(tls.Options[agentgatewaySpiffeAcceptedTrustDomainsKey])),
+				}, nil
+			}
+			// Accepted trust domains only make sense when the identity is SPIFFE-sourced.
+			if tls.Options[agentgatewaySpiffeAcceptedTrustDomainsKey] != "" {
+				return dummyTls, &ConfigError{
+					Reason:  InvalidTLS,
+					Message: fmt.Sprintf("%s is only valid when %s is SPIFFE", agentgatewaySpiffeAcceptedTrustDomainsKey, agentgatewayTLSCertificateSourceKey),
+				}
+			}
+			switch terminateMode {
 			case "ISTIO_SIMPLE":
 				return &TLSInfo{IstioWorkloadCert: true}, nil
 			case "ISTIO_MUTUAL":
