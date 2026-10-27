@@ -20,7 +20,7 @@ use crate::{
 	client, serdes, telemetry, types,
 };
 
-const DEFAULT_UI_USER_ATTRIBUTE: &str = r#"coalesce(apiKey.user, apiKey.name, apiKey.owner, jwt.sub, jwt.email, basicAuth.username, source.identity.namespace + "/" + source.identity.serviceAccount, source.subjectCn, null)"#;
+const DEFAULT_UI_USER_ATTRIBUTE: &str = r#"coalesce(apiKey["agentgateway.dev/owner"], apiKey.user, apiKey.name, apiKey.owner, jwt.sub, jwt.email, basicAuth.username, source.identity.namespace + "/" + source.identity.serviceAccount, source.subjectCn, null)"#;
 const DEFAULT_UI_GROUP_ATTRIBUTE: &str = r#"coalesce(apiKey.group, jwt.groups[0], null)"#;
 
 #[derive(Default)]
@@ -37,9 +37,17 @@ pub fn parse_config(
 	// Shellexpend before parsing it
 	let contents = contents.replace("# yaml-language-server: $schema", "#");
 	let contents = shellexpand::full(&contents)?;
-	let nested: NestedRawConfig = serdes::yamlviajson::from_str(&contents).ctx("invalid config")?;
+	let nested: NestedRawConfig = serdes::yaml::from_str(&contents).ctx("invalid config")?;
 	let raw = nested.config.unwrap_or_default();
 	cel::register_custom_functions(&raw.custom_functions).ctx("invalid config.customFunctions")?;
+	let sensitive_headers = raw
+		.sensitive_headers
+		.iter()
+		.map(|name| {
+			::http::HeaderName::from_str(name)
+				.map_err(|e| anyhow::anyhow!("invalid sensitive header '{name}': {e}"))
+		})
+		.collect::<anyhow::Result<Vec<_>>>()?;
 
 	let ipv6_enabled = parse::<bool>("IPV6_ENABLED")?
 		.or(raw.enable_ipv6)
@@ -136,10 +144,12 @@ pub fn parse_config(
 		} else {
 			crate::control::RootCert::Default
 		};
+		let headers = parse_headers("XDS_HEADER_").ctx("invalid XDS_HEADER_*")?;
 		XDSConfig {
 			address,
 			auth,
 			ca_cert: xds_root_cert,
+			headers,
 			namespace: namespace.into(),
 			gateway: gateway.into(),
 			local_config,
@@ -231,6 +241,14 @@ pub fn parse_config(
 	} else {
 		None
 	};
+
+	let spiffe = raw.spiffe.and_then(|cfg| {
+		cfg.endpoint.map(|endpoint| crate::control::spiffe::Config {
+			endpoint,
+			allow_additional_trust_domains: cfg.allow_additional_trust_domains,
+		})
+	});
+
 	let network = parse("NETWORK")?.or(raw.network).unwrap_or_default();
 
 	// Self-identity for locality-aware load balancing.
@@ -286,6 +304,34 @@ pub fn parse_config(
 		.unwrap_or_default();
 	let termination_max_deadline =
 		parse_duration("CONNECTION_TERMINATION_DEADLINE")?.or(raw.connection_termination_deadline);
+	let termination_max_deadline = match termination_max_deadline {
+		Some(period) => period,
+		None => match parse::<u64>("TERMINATION_GRACE_PERIOD_SECONDS")? {
+			// We want our drain period to be less than Kubernetes, so we can use the last few seconds
+			// to abruptly terminate anything remaining before Kubernetes SIGKILLs us.
+			// We could just take the SIGKILL, but it is even more abrupt (TCP RST vs RST_STREAM/TLS close, etc)
+			// Note: we do this in code instead of in configuration so that we can use downward API to expose this variable
+			// if it is added to Kubernetes (https://github.com/kubernetes/kubernetes/pull/125746).
+			Some(secs) => Duration::from_secs(cmp::max(
+				if secs > 10 {
+					secs - 5
+				} else {
+					// If the grace period is really low give less buffer
+					secs - 1
+				},
+				1,
+			)),
+			None => Duration::from_secs(5),
+		},
+	};
+	let termination_min_deadline = if termination_min_deadline > termination_max_deadline {
+		warn!(
+			"connectionMinTerminationDeadline ({termination_min_deadline:?}) exceeds connectionTerminationDeadline ({termination_max_deadline:?}); using the maximum for both"
+		);
+		termination_max_deadline
+	} else {
+		termination_min_deadline
+	};
 	let tracing_env = resolve_tracing_env_overrides().ctx("invalid tracing environment overrides")?;
 
 	let mut otlp_headers = raw
@@ -330,12 +376,21 @@ pub fn parse_config(
 		ThreadingMode::default()
 	};
 
-	let session_encoder = if let Some(key) = parse::<String>("SESSION_KEY")? {
-		crate::http::sessionpersistence::Encoder::aes(key.trim())
-			.ctx("invalid session persistence key SESSION_KEY")?
+	let session_key_env = parse::<String>("SESSION_KEY")?;
+	let session_key_unset = session_key_env.is_none() && raw.session.is_none();
+	let session_encoder = if let Some(key) = session_key_env {
+		if key.trim() == "disabled" {
+			crate::http::sessionpersistence::Encoder::base64()
+		} else {
+			crate::http::sessionpersistence::Encoder::aes(key.trim())
+				.ctx("invalid session persistence key SESSION_KEY")?
+		}
 	} else {
 		match raw.session.as_ref() {
 			None => crate::http::sessionpersistence::Encoder::base64(),
+			Some(session) if session.key.expose_secret() == "disabled" => {
+				crate::http::sessionpersistence::Encoder::base64()
+			},
 			Some(session) => {
 				let key = session.key.expose_secret();
 				crate::http::sessionpersistence::Encoder::aes(key)
@@ -369,9 +424,12 @@ pub fn parse_config(
 		anyhow::bail!("config.logging.database.maxConnections must be greater than zero");
 	}
 	let logging_database = explicit_logging_database.or_else(|| database.clone());
-	let storage = StorageConfig {
-		mode: raw.storage.clone().unwrap_or_default().mode,
+
+	let mut storage_mode = raw.storage.clone().unwrap_or_default().mode;
+	if parse::<bool>("UI_READ_ONLY")?.unwrap_or(false) {
+		storage_mode = ConfigStoreMode::ReadOnly;
 	};
+	let storage = StorageConfig { mode: storage_mode };
 	if storage.mode == ConfigStoreMode::Hybrid && database.is_none() {
 		anyhow::bail!("config.storage.mode=hybrid requires config.database.url");
 	}
@@ -385,6 +443,7 @@ pub fn parse_config(
 		);
 	}
 
+	let hbone_defaults = agent_hbone::Config::default();
 	Ok(crate::Config {
 		ipv6_enabled,
 		network: network.clone().into(),
@@ -395,32 +454,17 @@ pub fn parse_config(
 		self_addr,
 		xds,
 		ca,
+		spiffe,
 		num_worker_threads: parse_worker_threads(raw.worker_threads)
 			.ctx("invalid WORKER_THREADS/config.workerThreads")?,
 		termination_min_deadline,
 		threading_mode,
 		backend: raw.backend,
+		callouts: raw.callouts,
 		admin_runtime_handle: None,
-		termination_max_deadline: match termination_max_deadline {
-				Some(period) => period,
-				None => match parse::<u64>("TERMINATION_GRACE_PERIOD_SECONDS")? {
-				// We want our drain period to be less than Kubernetes, so we can use the last few seconds
-				// to abruptly terminate anything remaining before Kubernetes SIGKILLs us.
-				// We could just take the SIGKILL, but it is even more abrupt (TCP RST vs RST_STREAM/TLS close, etc)
-				// Note: we do this in code instead of in configuration so that we can use downward API to expose this variable
-				// if it is added to Kubernetes (https://github.com/kubernetes/kubernetes/pull/125746).
-				Some(secs) => Duration::from_secs(cmp::max(
-					if secs > 10 {
-						secs - 5
-					} else {
-						// If the grace period is really low give less buffer
-						secs - 1
-					},
-					1,
-				)),
-				None => Duration::from_secs(5),
-			},
-		},
+		budget_policy: Arc::new(crate::http::budget::BudgetPolicy::default()),
+		config_reload_status: Arc::new(crate::ConfigReloadStatus::default()),
+		termination_max_deadline,
 		tracing: raw
 			.tracing
 			.clone()
@@ -517,6 +561,7 @@ pub fn parse_config(
 				.ctx("invalid config.metrics.fields")?
 				.unwrap_or_default(),
 		},
+		histograms: raw.histograms,
 		logging: telemetry::log::Config {
 			filter: raw
 					.logging
@@ -540,12 +585,14 @@ pub fn parse_config(
 			database: logging_database.clone(),
 				fields: logging_fields(raw.logging.as_ref().and_then(|f| f.fields.clone()))
 					.ctx("invalid config.logging.fields")?,
-				database_fields: if logging_database.is_some() {
-					database_logging_fields(raw.standard_attributes.as_ref())
-						.ctx("invalid config.standardAttributes")?
-				} else {
-					Default::default()
-				},
+				database_fields: Arc::new(arc_swap::ArcSwap::from_pointee(
+					standard_attributes(raw.standard_attributes.as_ref())
+						.ctx("invalid config.standardAttributes")?,
+				)),
+				session: Arc::new(arc_swap::ArcSwapOption::new(
+					session_attribute(raw.standard_attributes.as_ref())
+						.ctx("invalid config.standardAttributes.session")?,
+				)),
 		},
 		dns: client::Config {
 			resolver_cfg,
@@ -572,28 +619,32 @@ pub fn parse_config(
 		},
 		database,
 		storage,
+		sensitive_headers,
 		session_encoder,
+		session_key_unset,
 		oidc_cookie_encoder,
 			hbone: Arc::new(agent_hbone::Config {
-				// window size: per-stream limit
-				window_size: parse("HTTP2_STREAM_WINDOW_SIZE")
-					.ctx("invalid HTTP2_STREAM_WINDOW_SIZE")?
-					.or(raw.hbone.as_ref().and_then(|h| h.window_size))
-					.unwrap_or(4u32 * 1024 * 1024),
-			// connection window size: per connection.
-			// Setting this to the same value as window_size can introduce deadlocks in some applications
-			// where clients do not read data on streamA until they receive data on streamB.
-			// If streamA consumes the entire connection window, we enter a deadlock.
-			// A 4x limit should be appropriate without introducing too much potential buffering.
-				connection_window_size: parse("HTTP2_CONNECTION_WINDOW_SIZE")?
-					.or(raw.hbone.as_ref().and_then(|h| h.connection_window_size))
-					.unwrap_or(16u32 * 1024 * 1024),
-				frame_size: parse("HTTP2_FRAME_SIZE")?
-					.or(raw.hbone.as_ref().and_then(|h| h.frame_size))
-					.unwrap_or(1024u32 * 1024),
-				pool_max_streams_per_conn: parse("POOL_MAX_STREAMS_PER_CONNECTION")?
-					.or(raw.hbone.as_ref().and_then(|h| h.pool_max_streams_per_conn))
-					.unwrap_or(100u16),
+				h2: agent_hbone::H2Config {
+					// window size: per-stream limit
+					window_size: parse("HTTP2_STREAM_WINDOW_SIZE")
+						.ctx("invalid HTTP2_STREAM_WINDOW_SIZE")?
+						.or(raw.hbone.as_ref().and_then(|h| h.window_size))
+						.unwrap_or(hbone_defaults.h2.window_size),
+					// connection window size: per connection.
+					// Setting this to the same value as window_size can introduce deadlocks in some applications
+					// where clients do not read data on streamA until they receive data on streamB.
+					// If streamA consumes the entire connection window, we enter a deadlock.
+					// A 4x limit should be appropriate without introducing too much potential buffering.
+					connection_window_size: parse("HTTP2_CONNECTION_WINDOW_SIZE")?
+						.or(raw.hbone.as_ref().and_then(|h| h.connection_window_size))
+						.unwrap_or(hbone_defaults.h2.connection_window_size),
+					frame_size: parse("HTTP2_FRAME_SIZE")?
+						.or(raw.hbone.as_ref().and_then(|h| h.frame_size))
+						.unwrap_or(hbone_defaults.h2.frame_size),
+					max_streams_per_conn: parse("POOL_MAX_STREAMS_PER_CONNECTION")?
+						.or(raw.hbone.as_ref().and_then(|h| h.pool_max_streams_per_conn))
+						.unwrap_or(hbone_defaults.h2.max_streams_per_conn),
+				},
 				pool_unused_release_timeout: parse_duration("POOL_UNUSED_RELEASE_TIMEOUT")?
 					.or(
 						raw
@@ -601,7 +652,7 @@ pub fn parse_config(
 						.as_ref()
 						.and_then(|h| h.pool_unused_release_timeout),
 				)
-				.unwrap_or(Duration::from_secs(60 * 5)),
+				.unwrap_or(hbone_defaults.pool_unused_release_timeout),
 		}),
 	})
 }
@@ -627,7 +678,7 @@ fn logging_fields(fields: Option<RawLoggingFields>) -> anyhow::Result<LoggingFie
 	})
 }
 
-fn database_logging_fields(
+pub(crate) fn standard_attributes(
 	standard_attributes: Option<&crate::RawStandardAttributes>,
 ) -> anyhow::Result<LoggingFields> {
 	let add = [
@@ -642,6 +693,10 @@ fn database_logging_fields(
 			standard_attributes
 				.and_then(|attributes| attributes.group.clone())
 				.unwrap_or_else(|| DEFAULT_UI_GROUP_ATTRIBUTE.to_string()),
+		),
+		(
+			"agentgateway.session".to_string(),
+			"request.agent.session".to_string(),
 		),
 	];
 
@@ -659,6 +714,15 @@ fn database_logging_fields(
 		),
 	})
 }
+pub(crate) fn session_attribute(
+	standard_attributes: Option<&crate::RawStandardAttributes>,
+) -> anyhow::Result<Option<Arc<cel::Expression>>> {
+	let Some(session) = standard_attributes.and_then(|attributes| attributes.session.as_ref()) else {
+		return Ok(None);
+	};
+	Ok(Some(Arc::new(cel::Expression::new_strict(session)?)))
+}
+
 fn parse<T: FromStr>(env: &str) -> anyhow::Result<Option<T>>
 where
 	<T as FromStr>::Err: ToString,
@@ -1032,6 +1096,85 @@ mod parse_headers_tests {
 	}
 }
 
+/// Generates and persists a session key when none is configured, so MCP sessions are encrypted
+/// by default. In hybrid mode the key is shared through the database; in file mode it is written
+/// back to `config.session.key` in the config file.
+pub async fn ensure_session_key(
+	config: &mut Config,
+	config_source: Option<&ConfigSource>,
+	store: Option<&crate::config_store::ConfigResourceStore>,
+) -> anyhow::Result<()> {
+	if !config.session_key_unset {
+		return Ok(());
+	}
+	let key = match (store, config_source) {
+		(Some(store), _) => Some(store.session_key().await?),
+		(None, Some(ConfigSource::File(path))) if config.storage.mode == ConfigStoreMode::File => {
+			match persist_session_key(path).await {
+				Ok(key) => Some(key),
+				Err(err) => {
+					warn!(?err, path = %path.display(), "failed to write generated session key");
+					None
+				},
+			}
+		},
+		_ => None,
+	};
+	match key {
+		Some(key) => {
+			config.session_encoder =
+				crate::http::sessionpersistence::Encoder::aes(&key).ctx("invalid generated session key")?;
+		},
+		None => warn!(
+			"no session key configured; MCP session IDs are not encrypted. Set SESSION_KEY or config.session.key"
+		),
+	}
+	Ok(())
+}
+
+async fn persist_session_key(path: &Path) -> anyhow::Result<String> {
+	let key = crate::config_store::generate_session_key()?;
+	let current = fs_err::tokio::read_to_string(path).await?;
+	let mut document = yaml_serde_edit::YamlObject::<serde_json::Value>::parse(&current)?;
+	let mut cfg = document.get().clone();
+	let section = cfg
+		.as_object_mut()
+		.context("config file must be an object")?
+		.entry("config")
+		.or_insert(serde_json::Value::Null);
+	if section.is_null() {
+		*section = serde_json::json!({});
+	}
+	section
+		.as_object_mut()
+		.context("config.config must be an object")?
+		.insert("session".to_string(), serde_json::json!({ "key": key }));
+	let content = match document.set(cfg.clone()) {
+		Ok(()) => document.get_string().to_owned(),
+		Err(yaml_serde_edit::Error::RoundTrip) => crate::yaml::to_string(&cfg)?,
+		Err(e) => return Err(e.into()),
+	};
+	let content = content
+		.lines()
+		.map(|line| {
+			if line.contains(&key) {
+				let indent = &line[..line.len() - line.trim_start().len()];
+				format!(
+					"{indent}# Auto-generated by agentgateway to encode session IDs. Changing it invalidates existing sessions.\n{line}\n"
+				)
+			} else {
+				format!("{line}\n")
+			}
+		})
+		.collect::<String>();
+	fs_err::tokio::write(path, content).await?;
+	info!(
+		path = %path.display(),
+		"generated a session key and wrote it to config.session.key; we recommend setting SESSION_KEY instead"
+	);
+	Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::env;
@@ -1229,6 +1372,43 @@ config:
 	}
 
 	#[test]
+	fn min_termination_deadline_clamps_to_max() {
+		let _env_lock = lock_env();
+
+		let config = parse_config(
+			r#"
+config:
+  connectionMinTerminationDeadline: 10s
+  connectionTerminationDeadline: 5s
+"#
+			.to_string(),
+			None,
+		)
+		.unwrap();
+
+		assert_eq!(config.termination_max_deadline, Duration::from_secs(5));
+		assert_eq!(config.termination_min_deadline, Duration::from_secs(5));
+	}
+
+	#[test]
+	fn min_termination_deadline_clamps_to_derived_max() {
+		let _env_lock = lock_env();
+
+		let config = parse_config(
+			r#"
+config:
+  connectionMinTerminationDeadline: 10s
+"#
+			.to_string(),
+			None,
+		)
+		.unwrap();
+
+		assert_eq!(config.termination_max_deadline, Duration::from_secs(5));
+		assert_eq!(config.termination_min_deadline, Duration::from_secs(5));
+	}
+
+	#[test]
 	fn tracing_requires_endpoint_from_config_or_env() {
 		let _env_lock = lock_env();
 
@@ -1257,6 +1437,44 @@ config:
 
 		assert_eq!(config.storage.mode, ConfigStoreMode::File);
 		assert!(config.database.is_none());
+	}
+
+	#[test]
+	fn xds_headers_are_loaded_from_environment() {
+		let _env_lock = lock_env();
+		let _address = TempEnvVar::set("XDS_ADDRESS", "http://127.0.0.1:15010");
+		let _namespace = TempEnvVar::set("NAMESPACE", "default");
+		let _gateway = TempEnvVar::set("GATEWAY", "agentgateway");
+		let _revision = TempEnvVar::set("XDS_HEADER_X_ISTIO_REVISION", "canary");
+		let _tenant = TempEnvVar::set("XDS_HEADER_X_TENANT", "team-a");
+
+		let config = parse_config("{}".to_string(), None).expect("config should parse");
+
+		assert!(
+			config
+				.xds
+				.headers
+				.contains(&("x-istio-revision".to_string(), "canary".to_string()))
+		);
+		assert!(
+			config
+				.xds
+				.headers
+				.contains(&("x-tenant".to_string(), "team-a".to_string()))
+		);
+	}
+
+	#[test]
+	fn invalid_xds_header_is_rejected_during_startup() {
+		let _env_lock = lock_env();
+		let _header = TempEnvVar::set("XDS_HEADER_X_TENANT", "bad\nvalue");
+
+		let err = parse_config("{}".to_string(), None).expect_err("invalid header should fail");
+
+		assert!(
+			err.to_string().contains("invalid XDS_HEADER_*"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[test]
@@ -1696,5 +1914,29 @@ config:
 		unsafe {
 			env::remove_var("SESSION_KEY");
 		}
+	}
+
+	#[test]
+	fn spiffe_disabled_without_endpoint() {
+		let _env = lock_env();
+		let config = parse_config("{}".to_string(), None).expect("config should parse");
+		assert!(
+			config.spiffe.is_none(),
+			"SPIFFE must be disabled when no socket is configured"
+		);
+	}
+
+	#[test]
+	fn spiffe_enabled_from_raw_endpoint_field() {
+		let _env = lock_env();
+		let config = parse_config(
+			"config:\n  spiffe:\n    endpoint: unix:///run/spire/agent.sock\n".to_string(),
+			None,
+		)
+		.expect("config should parse");
+		let spiffe = config
+			.spiffe
+			.expect("spiffe.endpoint should enable the SPIFFE Workload API");
+		assert_eq!(spiffe.endpoint, "unix:///run/spire/agent.sock");
 	}
 }

@@ -5,9 +5,16 @@ use std::path::{Path, PathBuf};
 
 use agentgateway::ConfigSource;
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use include_dir::Dir;
 use pprof_alloc::Allocator;
 
 mod commands;
+
+// Keep embedded asset changes scoped to relinking the binary crate.
+#[cfg(ui_assets)]
+static UI_ASSETS: Dir<'static> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
+#[cfg(not(ui_assets))]
+static UI_ASSETS: Dir<'static> = Dir::new("", &[]);
 
 cfg_select! {
 	all(target_os = "linux", target_env = "musl", target_arch = "aarch64") => {
@@ -132,6 +139,12 @@ struct Cli {
 }
 
 pub fn run() -> anyhow::Result<()> {
+	// Disable transparent huge pages process-wide. Allocator settings only cover their own mappings;
+	// other mappings (such as thread stacks) can otherwise be backed by 2MB pages and inflate RSS.
+	#[cfg(target_os = "linux")]
+	unsafe {
+		libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+	}
 	cfg_select! {
 		all(target_os = "linux", target_env = "musl", target_arch = "aarch64") => {
 			pprof_alloc::configure_with_default(Allocator::Mimalloc)?;
@@ -250,7 +263,7 @@ fn default_config_contents(dir: &std::path::Path) -> anyhow::Result<String> {
 	let db = dir.join("data.db");
 	let config =
 		agentgateway::types::local::default_standalone_config(&format!("sqlite://{}", db.display()));
-	let yaml = agentgateway::yamlviajson::to_string(&config)?;
+	let yaml = agentgateway::yaml::to_string(&config)?;
 	Ok(format!(
 		"# yaml-language-server: $schema=https://agentgateway.dev/schema/config\n{yaml}"
 	))

@@ -141,3 +141,97 @@ spec:
 		}
 	}
 }
+
+func TestAzureManagedIdentityScopeValidation(t *testing.T) {
+	const policy = `apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: azure-auth
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway
+  backend:
+    auth:
+      azure:
+        %s
+        scopes:
+        - scope-one
+        %s
+`
+
+	tests := []struct {
+		name       string
+		credential string
+		second     string
+		wantError  bool
+	}{
+		{name: "managed identity with one scope", credential: "managedIdentity: {}"},
+		{name: "managed identity with two scopes", credential: "managedIdentity: {}", second: "- scope-two", wantError: true},
+		{name: "workload identity with two scopes", credential: "workloadIdentity: {}", second: "- scope-two"},
+		{name: "implicit auth with two scopes", second: "- scope-two"},
+	}
+
+	validator := NewAgentgatewayValidator(t)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validator.ValidateCustomResourceYAML(
+				fmt.Sprintf(policy, test.credential, test.second),
+				nil,
+			)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "managedIdentity supports exactly one scope") {
+					t.Fatalf("expected managed identity scope validation error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected policy to be valid, got %v", err)
+			}
+		})
+	}
+}
+
+func TestBackendTLSAdditionalTrustDomainsValidation(t *testing.T) {
+	const policy = `apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: spiffe-backend
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway
+  backend:
+    tls:
+      certificateSource: SPIFFE
+      additionalTrustDomains:
+      - %q
+`
+	tests := []struct {
+		name      string
+		domain    string
+		wantError bool
+	}{
+		{name: "domain", domain: "prod.example.com"},
+		{name: "mixed case and underscore", domain: "Prod_1.example"},
+		{name: "maximum length", domain: strings.Repeat("a", 255)},
+		{name: "empty", domain: "", wantError: true},
+		{name: "too long", domain: strings.Repeat("a", 256), wantError: true},
+		{name: "scheme", domain: "spiffe://example.org", wantError: true},
+		{name: "path", domain: "example.org/workload", wantError: true},
+		{name: "space", domain: "bad domain", wantError: true},
+		{name: "port", domain: "example.org:443", wantError: true},
+		{name: "wildcard", domain: "*.example.org", wantError: true},
+	}
+	validator := NewAgentgatewayValidator(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validator.ValidateCustomResourceYAML(fmt.Sprintf(policy, tt.domain), nil)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("validation error = %v, wantError = %v", err, tt.wantError)
+			}
+		})
+	}
+}

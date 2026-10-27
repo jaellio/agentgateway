@@ -43,7 +43,7 @@ type AgentgatewayModelList struct {
 // +kubebuilder:validation:ExactlyOneOf=provider;virtualModel
 // +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.baseURL)",message="baseURL requires provider"
 // +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.policies)",message="policies cannot be used with virtualModel"
-// +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || self.visibility != 'Internal'",message="virtual models must be public"
+// +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.visibility) || self.visibility != 'Internal'",message="virtual models must be public"
 // +kubebuilder:validation:XValidation:rule="!has(self.virtualModel) || !has(self.match) || !has(self.match.model) || !self.match.model.contains('*')",message="virtual model match.model must be an exact name"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'Ollama' || has(self.baseURL)",message="ollama requires baseURL"
 // +kubebuilder:validation:XValidation:rule="!has(self.baseURL) || (isURL(self.baseURL) && (url(self.baseURL).getScheme() == 'http' || url(self.baseURL).getScheme() == 'https') && url(self.baseURL).getHostname() != \"\")",message="baseURL must be an absolute http or https URL with a host"
@@ -56,7 +56,15 @@ type AgentgatewayModelList struct {
 // +kubebuilder:validation:XValidation:rule="has(self.bedrock) == (has(self.provider) && self.provider == 'Bedrock')",message="bedrock must be set if and only if provider is Bedrock"
 // +kubebuilder:validation:XValidation:rule="has(self.custom) == (has(self.provider) && self.provider == 'Custom')",message="custom must be set if and only if provider is Custom"
 type AgentgatewayModelSpec struct {
-	// Gateways and listeners to which this model attaches.
+	// Parent resources to which this model attaches. Supported parent kinds are
+	// Gateway, ListenerSet, and HTTPRoute.
+	//
+	// A Gateway or ListenerSet parent attaches the model directly to its
+	// listeners. An HTTPRoute parent attaches the model to the referenced rule;
+	// sectionName selects a named rule, or the HTTPRoute must contain exactly
+	// one rule when sectionName is omitted. The selected rule must use exactly
+	// one AgentgatewayModel backend with name "*". If the rule has path matches,
+	// they must use PathPrefix matching.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=16
 	// +required
@@ -68,7 +76,6 @@ type AgentgatewayModelSpec struct {
 
 	// Controls whether clients can request this model directly. Internal models
 	// can only be selected by virtual models. Defaults to Public.
-	// +kubebuilder:default=Public
 	// +optional
 	Visibility ModelVisibility `json:"visibility,omitempty"`
 
@@ -96,6 +103,10 @@ type AgentgatewayModelSpec struct {
 	// BaseURL overrides the provider address and base path prefix. It must use the
 	// http or https scheme. Backend policies may override the default TLS
 	// configuration. Query parameters, fragments, and user info are not supported.
+	// The URL path is the upstream base path and defaults to / when omitted.
+	// Provider-specific endpoint paths are appended to this base path.
+	// For example, `https://api.openai.com/v1` sends completions to `/v1/chat/completions`,
+	// while `https://api.openai.com` sends them to `/chat/completions`.
 	// +kubebuilder:validation:Format=uri
 	// +optional
 	BaseURL *LongString `json:"baseURL,omitempty"`
@@ -119,6 +130,15 @@ type ModelPolicies struct {
 	// +listMapKey=field
 	// +optional
 	Transformations []FieldTransformation `json:"transformations,omitempty"`
+
+	// CEL transformations applied to fields in the provider request body.
+	// After conversion from one provider format to another, these transformations are applied to the converted request body.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	// +listType=map
+	// +listMapKey=field
+	// +optional
+	FinalTransformations []FieldTransformation `json:"finalTransformations,omitempty"`
 
 	// Authorization rules that clients must satisfy to use this model.
 	// +optional
@@ -240,6 +260,7 @@ type ModelProvider string
 
 const (
 	ModelProviderOpenAI      ModelProvider = "OpenAI"
+	ModelProviderCopilot     ModelProvider = "Copilot"
 	ModelProviderAzure       ModelProvider = "Azure"
 	ModelProviderAnthropic   ModelProvider = "Anthropic"
 	ModelProviderGemini      ModelProvider = "Gemini"
@@ -258,6 +279,9 @@ const (
 	ModelProviderTogetherAI  ModelProvider = "TogetherAI"
 	ModelProviderXAI         ModelProvider = "XAI"
 	ModelProviderFireworks   ModelProvider = "Fireworks"
+	ModelProviderMeta        ModelProvider = "Meta"
+	ModelProviderPerplexity  ModelProvider = "Perplexity"
+	ModelProviderTypesafe    ModelProvider = "Typesafe"
 	ModelProviderCustom      ModelProvider = "Custom"
 )
 
@@ -274,7 +298,7 @@ const (
 	ModelVisibilityInternal ModelVisibility = "Internal"
 )
 
-// +kubebuilder:validation:ExactlyOneOf=weighted;failover;conditional
+// +kubebuilder:validation:ExactlyOneOf=weighted;failover;conditional;callout
 type VirtualModel struct {
 	// Weight-based model selection.
 	// +optional
@@ -287,6 +311,10 @@ type VirtualModel struct {
 	// Ordered condition-based model selection.
 	// +optional
 	Conditional *ConditionalModelRouting `json:"conditional,omitempty"`
+
+	// Model selection by calling an external HTTP service.
+	// +optional
+	Callout *CalloutModelRouting `json:"callout,omitempty"`
 }
 
 type WeightedModelRouting struct {
@@ -301,7 +329,6 @@ type WeightedModelTarget struct {
 	ModelTargetReference `json:",inline"`
 
 	// Relative traffic weight. Defaults to 1.
-	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000000
 	// +optional
@@ -347,6 +374,72 @@ type ConditionalModelTarget struct {
 	// Omit only on the final fallback target.
 	// +optional
 	When *CELExpression `json:"when,omitempty"`
+}
+
+// +kubebuilder:validation:ExactlyOneOf=backendRef;url
+type CalloutModelRouting struct {
+	// Service that selects the model. Supported types: `Service` and `Backend`.
+	// A `url` may include the request path, such as `https://router.example.com/v1/route`.
+	// The callout request is sent with the `POST` method.
+	PolicyBackendEndpoint `json:",inline"`
+
+	// Headers to set on the callout request, computed from CEL expressions.
+	// Keys may be header names or the `:path`, `:method`, and `:authority`
+	// pseudo-headers.
+	// +kubebuilder:validation:MaxProperties=64
+	// +optional
+	Headers map[string]CELExpression `json:"headers,omitempty"`
+
+	// CEL expression that computes the callout request body. Strings and bytes
+	// are used directly; other values are JSON-encoded. If unset, the original
+	// request body is forwarded.
+	// +optional
+	Body *CELExpression `json:"body,omitempty"`
+
+	// CEL expressions that compute request payload fields from the callout
+	// response, overriding existing values. `callout.headers` holds the response
+	// headers and `callout.body` the decoded JSON response body. `model` is
+	// required and selects the concrete model name, which is matched against the
+	// effective match.model of models attached to the same listener.
+	// +kubebuilder:validation:MinProperties=1
+	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="has(self.model)",message="transformation must set model"
+	// +required
+	Transformation map[string]CELExpression `json:"transformation"`
+
+	// Model used when the callout fails, returns a non-2xx or non-JSON
+	// response, or selects an unknown model. `transformation` is not applied to
+	// the fallback. If unset, the request is rejected.
+	// +optional
+	Fallback *ModelTargetReference `json:"fallback,omitempty"`
+
+	// Reuse callout responses using CEL expressions as the cache key. On a cache
+	// hit, `transformation` is evaluated against the cached response. Keying on
+	// a session identifier makes routing sticky for that session.
+	// +optional
+	Cache *CalloutCache `json:"cache,omitempty"`
+}
+
+type CalloutCache struct {
+	// Ordered list of CEL expressions evaluated against the request to
+	// construct the cache key.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +required
+	Key []CELExpression `json:"key"`
+
+	// Duration string, such as `5m`, or a CEL expression that returns the
+	// duration that a cached callout response may be reused, or a timestamp
+	// when it expires. The expression is evaluated with `callout` available,
+	// before `transformation` is applied.
+	// +required
+	TTL CELExpression `json:"ttl"`
+
+	// Maximum number of callout responses to keep in the cache. If unset, this
+	// defaults to 10000.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxEntries *uint32 `json:"maxEntries,omitempty"`
 }
 
 type ModelTargetReference struct {

@@ -3,6 +3,7 @@ source: crates/llm/src/golden_tests.rs
 description: src/tests/requests/completions/tool-call.json
 info:
   model: gpt-3.5-turbo
+  tools: []
   messages:
     - role: user
       content: How is the current weather in Columbus?
@@ -14,10 +15,19 @@ info:
           function:
             name: get_weather
             arguments: "{\"format\":\"celsius\",\"location\":\"Columbus, OH\"}"
+        - id: call_5rQmXtLpZ9wKvNbJhGyDsFcE
+          type: function
+          function:
+            name: get_time
+            arguments: ""
     - role: tool
       tool_call_id: call_iMGPsr4Xx1u0G5sOzFsTCbQU
       name: get_weather
       content: "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+    - role: tool
+      tool_call_id: call_5rQmXtLpZ9wKvNbJhGyDsFcE
+      name: get_time
+      content: "{ \"time\": \"2026-08-12T12:00:00Z\" }"
 ---
 {
   "request": {
@@ -42,6 +52,12 @@ info:
               "format": "celsius",
               "location": "Columbus, OH"
             }
+          },
+          {
+            "type": "tool_use",
+            "id": "call_5rQmXtLpZ9wKvNbJhGyDsFcE",
+            "name": "get_time",
+            "input": {}
           }
         ]
       },
@@ -54,10 +70,21 @@ info:
             "content": "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
           }
         ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_5rQmXtLpZ9wKvNbJhGyDsFcE",
+            "content": "{ \"time\": \"2026-08-12T12:00:00Z\" }"
+          }
+        ]
       }
     ],
     "model": "gpt-3.5-turbo",
-    "max_tokens": 4096
+    "max_tokens": 4096,
+    "tools": []
   },
   "parsed": {
     "input_format": "Completions",
@@ -78,6 +105,10 @@ info:
       {
         "role": "tool",
         "content": "{ \"temperature\": 15, \"condition\": \"Cloudy\" }"
+      },
+      {
+        "role": "tool",
+        "content": "{ \"time\": \"2026-08-12T12:00:00Z\" }"
       }
     ]
   }

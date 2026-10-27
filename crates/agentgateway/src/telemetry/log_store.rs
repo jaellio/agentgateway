@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use std::{env, thread};
 
@@ -23,6 +23,7 @@ static REQUEST_LOG_STORE_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 #[derive(Eq, PartialEq)]
 pub struct Config {
 	/// Connection URL for the request log database. A postgres:// or postgresql:// URL uses Postgres; any other value is treated as a SQLite database.
+	#[serde(serialize_with = "crate::serdes::ser_redact")]
 	pub url: String,
 	/// Maximum number of connections to open in this database's connection pool. Defaults to 5.
 	/// When the request log and config stores have matching database settings, they share one pool
@@ -38,7 +39,7 @@ pub struct RequestLogStore {
 }
 
 impl RequestLogStore {
-	pub fn emit(&self, record: StoredRequestLog) {
+	pub(super) fn emit(&self, record: PendingRequestLog) {
 		REQUEST_LOG_STORE_BACKLOG.fetch_add(1, Ordering::Relaxed);
 		if let Err(err) = self.tx.send(LogStoreMsg::Record(record)) {
 			REQUEST_LOG_STORE_BACKLOG.fetch_sub(1, Ordering::Relaxed);
@@ -83,7 +84,7 @@ pub async fn setup_with_pool(
 	})
 }
 
-pub fn emit(record: StoredRequestLog) {
+pub(super) fn emit(record: PendingRequestLog) {
 	if let Some(store) = REQUEST_LOG_STORE.get() {
 		store.emit(record);
 	}
@@ -161,7 +162,7 @@ const LOG_STORE_BATCH_SIZE_ENV: &str = "REQUEST_LOG_STORE_BATCH_SIZE";
 
 #[allow(clippy::large_enum_variant)] // The StoredRequestLog, which is used 99.9% of the time, is the large one
 enum LogStoreMsg {
-	Record(StoredRequestLog),
+	Record(PendingRequestLog),
 	Search {
 		request: SearchRequest,
 		tx: QueryResponse<SearchResponse>,
@@ -327,7 +328,14 @@ async fn process_log_store_msg(
 	msg: LogStoreMsg,
 ) -> bool {
 	match msg {
-		LogStoreMsg::Record(record) => {
+		LogStoreMsg::Record(pending) => {
+			let mut record = pending.record;
+			record.payload = super::log::database_llm_payload(
+				pending.llm_mode,
+				pending.input_messages.as_deref().map(Vec::as_slice),
+				pending.llm_response.as_ref(),
+			);
+			record.has_payload = record.payload.is_some();
 			batch.push(record);
 			false
 		},
@@ -377,6 +385,15 @@ async fn flush_log_store_batch(backend: &Backend, batch: &mut Vec<StoredRequestL
 	batch.clear();
 }
 
+// Keep captured content in its original form until it reaches the database worker.
+// Normalization and JSON serialization can be expensive for large prompts and completions.
+pub(super) struct PendingRequestLog {
+	pub record: StoredRequestLog,
+	pub llm_mode: Option<crate::types::frontend::DatabaseLlmMode>,
+	pub input_messages: Option<Arc<Vec<agent_llm::types::NormalizedMessage>>>,
+	pub llm_response: Option<crate::cel::LLMContext>,
+}
+
 #[derive(Clone, Debug)]
 pub struct StoredRequestLog {
 	pub id: String,
@@ -394,6 +411,11 @@ pub struct StoredRequestLog {
 	pub input_tokens: Option<i64>,
 	pub output_tokens: Option<i64>,
 	pub total_tokens: Option<i64>,
+	pub cache_read_input_tokens: Option<i64>,
+	pub cache_creation_input_tokens: Option<i64>,
+	pub reasoning_tokens: Option<i64>,
+	pub time_to_first_token_ms: Option<f64>,
+	pub time_per_output_token_ms: Option<f64>,
 	pub cost: Option<f64>,
 	pub agentgateway_user: Option<String>,
 	pub agentgateway_group: Option<String>,
@@ -502,7 +524,52 @@ pub enum GroupByField {
 	ResponseModel,
 	HttpStatus,
 	Attributes,
+	/// Time to first token histogram; the group value is the bucket's lower bound in milliseconds.
+	/// Requests without a first token (non-streaming) group under null.
+	Ttft,
+	/// Output tokens per second histogram; the group value is the bucket's lower bound.
+	OutputTokensPerSecond,
 }
+
+pub(crate) const MIGRATIONS_TABLE: &str = "_agentgateway_request_log_migrations";
+
+pub(crate) const TTFT_BOUNDS_MS: &[i64] = &[
+	0, 100, 250, 500, 1000, 2000, 5000, 10_000, 30_000, 60_000, 120_000, 300_000,
+];
+pub(crate) const OUTPUT_TOKENS_PER_SECOND_BOUNDS: &[i64] = &[
+	0, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 25_000,
+];
+
+/// A `CASE` labelling each row with the lower bound of the bucket `value` falls in, or NULL when
+/// `value` is NULL.
+pub(crate) fn histogram_bucket_sql(value: &str, bounds: &[i64]) -> String {
+	let mut sql = format!("CASE WHEN {value} IS NULL THEN NULL");
+	for pair in bounds.windows(2) {
+		sql.push_str(&format!(" WHEN {value} < {} THEN '{}'", pair[1], pair[0]));
+	}
+	let last = bounds.last().copied().unwrap_or_default();
+	sql.push_str(&format!(" ELSE '{last}' END"));
+	sql
+}
+
+/// The `AnalyticsTotals` select list, valid in both SQLite and Postgres. Aliases must match the
+/// struct's field names.
+pub(crate) const ANALYTICS_TOTALS_SELECT: &str = "\
+	COUNT(*) AS requests, \
+	CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT) AS total_tokens, \
+	CAST(COALESCE(SUM(cost), 0) AS DOUBLE PRECISION) AS cost, \
+	CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT) AS input_tokens, \
+	CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT) AS output_tokens, \
+	CAST(COALESCE(SUM(CASE WHEN http_status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END), 0) AS BIGINT) AS errors, \
+	CAST(COALESCE(SUM(duration_ms), 0) AS BIGINT) AS duration_ms, \
+	COUNT(time_to_first_token_ms) AS ttft_requests, \
+	CAST(COALESCE(SUM(time_to_first_token_ms), 0) AS DOUBLE PRECISION) AS ttft_ms, \
+	CAST(COALESCE(MAX(time_to_first_token_ms), 0) AS DOUBLE PRECISION) AS max_ttft_ms, \
+	CAST(COALESCE(SUM(CASE WHEN time_per_output_token_ms > 0 THEN output_tokens END), 0) AS BIGINT) AS generation_tokens, \
+	CAST(COALESCE(SUM(CASE WHEN time_per_output_token_ms > 0 THEN time_per_output_token_ms * output_tokens END), 0) AS DOUBLE PRECISION) AS generation_ms, \
+	CAST(COALESCE(SUM(cache_read_input_tokens), 0) AS BIGINT) AS cache_read_tokens, \
+	CAST(COALESCE(SUM(cache_creation_input_tokens), 0) AS BIGINT) AS cache_write_tokens, \
+	CAST(COALESCE(SUM(reasoning_tokens), 0) AS BIGINT) AS reasoning_tokens";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -541,13 +608,79 @@ pub struct TailEvent {
 	pub cursor: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsTotals {
+	pub requests: i64,
+	pub total_tokens: i64,
+	pub cost: f64,
+	pub input_tokens: i64,
+	pub output_tokens: i64,
+	/// Requests with an HTTP status >= 400 or a recorded error.
+	pub errors: i64,
+	/// Sum of request durations; divide by `requests` for the mean.
+	pub duration_ms: i64,
+	/// Requests with a recorded time to first token (streaming responses).
+	pub ttft_requests: i64,
+	/// Sum of time to first token; divide by `ttft_requests` for the mean.
+	pub ttft_ms: f64,
+	pub max_ttft_ms: f64,
+	/// Output tokens of requests with a recorded per-token time.
+	pub generation_tokens: i64,
+	/// Time spent generating those tokens; `generation_tokens` over this is the decode rate.
+	pub generation_ms: f64,
+	/// Input tokens served from the provider's prompt cache (included in `input_tokens`).
+	pub cache_read_tokens: i64,
+	/// Input tokens written to the provider's prompt cache (included in `input_tokens`).
+	pub cache_write_tokens: i64,
+	/// Reasoning tokens (included in `output_tokens`).
+	pub reasoning_tokens: i64,
+}
+
+impl AnalyticsTotals {
+	fn add(&mut self, other: &AnalyticsTotals) {
+		// Destructure so a new field fails to compile until it is merged here.
+		let AnalyticsTotals {
+			requests,
+			total_tokens,
+			cost,
+			input_tokens,
+			output_tokens,
+			errors,
+			duration_ms,
+			ttft_requests,
+			ttft_ms,
+			max_ttft_ms,
+			generation_tokens,
+			generation_ms,
+			cache_read_tokens,
+			cache_write_tokens,
+			reasoning_tokens,
+		} = other;
+		self.requests += requests;
+		self.total_tokens += total_tokens;
+		self.cost += cost;
+		self.input_tokens += input_tokens;
+		self.output_tokens += output_tokens;
+		self.errors += errors;
+		self.duration_ms += duration_ms;
+		self.ttft_requests += ttft_requests;
+		self.ttft_ms += ttft_ms;
+		self.max_ttft_ms = self.max_ttft_ms.max(*max_ttft_ms);
+		self.generation_tokens += generation_tokens;
+		self.generation_ms += generation_ms;
+		self.cache_read_tokens += cache_read_tokens;
+		self.cache_write_tokens += cache_write_tokens;
+		self.reasoning_tokens += reasoning_tokens;
+	}
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyticsGroup {
 	pub group: BTreeMap<String, Value>,
-	pub requests: i64,
-	pub total_tokens: i64,
-	pub cost: f64,
+	#[serde(flatten)]
+	pub totals: AnalyticsTotals,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -555,9 +688,24 @@ pub struct AnalyticsGroup {
 pub struct AnalyticsTimeBucket {
 	pub start: DateTime<Utc>,
 	pub group: BTreeMap<String, Value>,
-	pub requests: i64,
-	pub total_tokens: i64,
-	pub cost: f64,
+	#[serde(flatten)]
+	pub totals: AnalyticsTotals,
+}
+
+pub(crate) fn groups_from_buckets(buckets: &[AnalyticsTimeBucket]) -> Vec<AnalyticsGroup> {
+	let mut groups = BTreeMap::<String, AnalyticsGroup>::new();
+	for bucket in buckets {
+		let key = serde_json::to_string(&bucket.group).unwrap_or_default();
+		groups
+			.entry(key)
+			.or_insert_with(|| AnalyticsGroup {
+				group: bucket.group.clone(),
+				totals: AnalyticsTotals::default(),
+			})
+			.totals
+			.add(&bucket.totals);
+	}
+	groups.into_values().collect()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -571,6 +719,8 @@ pub struct LogEntry {
 	pub span_id: Option<String>,
 	pub http_status: Option<i64>,
 	pub error: Option<String>,
+	pub prompt_preview: Option<String>,
+	pub turn: TurnEntry,
 	pub gen_ai: GenAiEntry,
 	pub usage: UsageEntry,
 	pub cost: Option<f64>,
@@ -579,6 +729,76 @@ pub struct LogEntry {
 	pub attributes: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub payload: Option<PayloadEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEntry {
+	pub input: Option<TurnKind>,
+	pub output: Option<TurnKind>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnKind {
+	User,
+	Assistant,
+	ToolCall,
+	ToolResult,
+}
+
+fn prompt_preview(prompt: Option<&Value>) -> Option<String> {
+	let messages = prompt?.as_array()?;
+	messages.iter().rev().find_map(|message| {
+		if message.get("role").and_then(Value::as_str) != Some("user") {
+			return None;
+		}
+		let text = message
+			.get("parts")?
+			.as_array()?
+			.iter()
+			.filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+			.filter_map(|part| part.get("text").and_then(Value::as_str))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let text = text.trim();
+		if text.is_empty() {
+			None
+		} else if text.chars().nth(180).is_some() {
+			Some(format!("{}...", text.chars().take(177).collect::<String>()))
+		} else {
+			Some(text.to_string())
+		}
+	})
+}
+
+fn turn_kind(messages: Option<&Value>) -> Option<TurnKind> {
+	// Classify the final meaningful normalized part; reasoning and system text are not turns.
+	messages?.as_array()?.iter().rev().find_map(|message| {
+		let role = message.get("role").and_then(Value::as_str)?;
+		message
+			.get("parts")?
+			.as_array()?
+			.iter()
+			.rev()
+			.find_map(|part| match part.get("type").and_then(Value::as_str)? {
+				"toolCall" => Some(TurnKind::ToolCall),
+				"toolResult" => Some(TurnKind::ToolResult),
+				"text"
+					if part
+						.get("text")
+						.and_then(Value::as_str)
+						.is_some_and(|text| !text.trim().is_empty()) =>
+				{
+					match role {
+						"user" => Some(TurnKind::User),
+						"assistant" => Some(TurnKind::Assistant),
+						_ => None,
+					}
+				},
+				_ => None,
+			})
+	})
 }
 
 #[derive(Clone, Debug, Serialize)]
