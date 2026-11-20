@@ -14,12 +14,13 @@ import (
 
 func processRequestGuard(ctx PolicyCtx, namespace string, reqs []agentgateway.PromptguardRequest) ([]*api.BackendPolicySpec_Ai_RequestGuard, error) {
 	var res []*api.BackendPolicySpec_Ai_RequestGuard
+	var errs []error
 	for _, req := range reqs {
 		pgReq := &api.BackendPolicySpec_Ai_RequestGuard{}
 		if req.Webhook != nil {
 			wh, err := processWebhook(ctx, namespace, req.Webhook)
 			if err != nil {
-				return nil, err
+				errs = append(errs, err)
 			}
 			pgReq.Kind = &api.BackendPolicySpec_Ai_RequestGuard_Webhook{
 				Webhook: wh,
@@ -30,66 +31,101 @@ func processRequestGuard(ctx PolicyCtx, namespace string, reqs []agentgateway.Pr
 			}
 		} else if req.OpenAIModeration != nil {
 			pgReq.Kind = &api.BackendPolicySpec_Ai_RequestGuard_OpenaiModeration{
-				OpenaiModeration: processModeration(ctx, namespace, req.OpenAIModeration),
+				OpenaiModeration: processModeration(ctx, namespace, req.OpenAIModeration, req.Policies),
 			}
 		} else if req.BedrockGuardrails != nil {
 			pgReq.Kind = &api.BackendPolicySpec_Ai_RequestGuard_BedrockGuardrails{
-				BedrockGuardrails: processBedrockGuardrails(ctx, namespace, req.BedrockGuardrails),
+				BedrockGuardrails: processBedrockGuardrails(ctx, namespace, req.BedrockGuardrails, req.Policies),
 			}
 		} else if req.GoogleModelArmor != nil {
 			pgReq.Kind = &api.BackendPolicySpec_Ai_RequestGuard_GoogleModelArmor{
-				GoogleModelArmor: processGoogleModelArmor(ctx, namespace, req.GoogleModelArmor),
+				GoogleModelArmor: processGoogleModelArmor(ctx, namespace, req.GoogleModelArmor, req.Policies),
 			}
 		}
 
 		if req.CustomResponse != nil {
 			pgReq.Rejection = &api.BackendPolicySpec_Ai_RequestRejection{
-				Body:   []byte(req.CustomResponse.Message),
-				Status: uint32(req.CustomResponse.StatusCode), // nolint:gosec // G115: kubebuilder validation ensures safe for uint32
+				Body:    []byte(ptr.OrDefault(req.CustomResponse.Message, "The request was rejected due to inappropriate content")),
+				Status:  uint32(ptr.NonEmptyOrDefault(req.CustomResponse.StatusCode, 403)), // nolint:gosec // G115: kubebuilder validation ensures safe for uint32
+				Headers: processRejectionHeaders(req.CustomResponse.Headers),
 			}
+		}
+		for _, scope := range req.Scope {
+			pgReq.Scope = append(pgReq.Scope, processContentScope(scope))
 		}
 		res = append(res, pgReq)
 	}
 
-	return res, nil
+	return res, errors.Join(errs...)
+}
+
+func processContentScope(scope agentgateway.ContentScope) api.BackendPolicySpec_Ai_ContentScope {
+	switch scope {
+	case agentgateway.ContentScopeSystemPrompt:
+		return api.BackendPolicySpec_Ai_CONTENT_SCOPE_SYSTEM_PROMPT
+	case agentgateway.ContentScopeMessages:
+		return api.BackendPolicySpec_Ai_CONTENT_SCOPE_MESSAGES
+	case agentgateway.ContentScopeToolOutput:
+		return api.BackendPolicySpec_Ai_CONTENT_SCOPE_TOOL_OUTPUT
+	case agentgateway.ContentScopeToolInput:
+		return api.BackendPolicySpec_Ai_CONTENT_SCOPE_TOOL_INPUT
+	default:
+		return api.BackendPolicySpec_Ai_CONTENT_SCOPE_UNSPECIFIED
+	}
 }
 
 func processResponseGuard(ctx PolicyCtx, namespace string, resps []agentgateway.PromptguardResponse) ([]*api.BackendPolicySpec_Ai_ResponseGuard, error) {
 	var res []*api.BackendPolicySpec_Ai_ResponseGuard
-	for _, req := range resps {
-		pgReq := &api.BackendPolicySpec_Ai_ResponseGuard{}
-		if req.Webhook != nil {
-			wh, err := processWebhook(ctx, namespace, req.Webhook)
+	var errs []error
+	for _, resp := range resps {
+		pgResp := &api.BackendPolicySpec_Ai_ResponseGuard{}
+		if resp.Webhook != nil {
+			wh, err := processWebhook(ctx, namespace, resp.Webhook)
 			if err != nil {
-				return nil, err
+				errs = append(errs, err)
 			}
-			pgReq.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_Webhook{
+			pgResp.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_Webhook{
 				Webhook: wh,
 			}
-		} else if req.Regex != nil {
-			pgReq.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_Regex{
-				Regex: processRegex(req.Regex),
+		} else if resp.Regex != nil {
+			pgResp.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_Regex{
+				Regex: processRegex(resp.Regex),
 			}
-		} else if req.BedrockGuardrails != nil {
-			pgReq.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_BedrockGuardrails{
-				BedrockGuardrails: processBedrockGuardrails(ctx, namespace, req.BedrockGuardrails),
+		} else if resp.BedrockGuardrails != nil {
+			pgResp.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_BedrockGuardrails{
+				BedrockGuardrails: processBedrockGuardrails(ctx, namespace, resp.BedrockGuardrails, resp.Policies),
 			}
-		} else if req.GoogleModelArmor != nil {
-			pgReq.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_GoogleModelArmor{
-				GoogleModelArmor: processGoogleModelArmor(ctx, namespace, req.GoogleModelArmor),
+		} else if resp.GoogleModelArmor != nil {
+			pgResp.Kind = &api.BackendPolicySpec_Ai_ResponseGuard_GoogleModelArmor{
+				GoogleModelArmor: processGoogleModelArmor(ctx, namespace, resp.GoogleModelArmor, resp.Policies),
 			}
 		}
 
-		if req.CustomResponse != nil {
-			pgReq.Rejection = &api.BackendPolicySpec_Ai_RequestRejection{
-				Body:   []byte(req.CustomResponse.Message),
-				Status: uint32(req.CustomResponse.StatusCode), // nolint:gosec // G115: kubebuilder validation ensures safe for uint32
+		if resp.CustomResponse != nil {
+			pgResp.Rejection = &api.BackendPolicySpec_Ai_RequestRejection{
+				Body:    []byte(ptr.OrDefault(resp.CustomResponse.Message, "The request was rejected due to inappropriate content")),
+				Status:  uint32(ptr.NonEmptyOrDefault(resp.CustomResponse.StatusCode, 403)), // nolint:gosec // G115: kubebuilder validation ensures safe for uint32
+				Headers: processRejectionHeaders(resp.CustomResponse.Headers),
 			}
 		}
-		res = append(res, pgReq)
+		for _, scope := range resp.Scope {
+			pgResp.Scope = append(pgResp.Scope, processContentScope(scope))
+		}
+		res = append(res, pgResp)
 	}
 
-	return res, nil
+	return res, errors.Join(errs...)
+}
+
+func processRejectionHeaders(headers []gwv1.HTTPHeader) *api.HeaderModifier {
+	if len(headers) == 0 {
+		return nil
+	}
+	return &api.HeaderModifier{
+		// A rejection response starts with no headers. Use Add to preserve
+		// multiple values configured for the same header name.
+		Add: headerListToAgw(headers),
+	}
 }
 
 func processPromptEnrichment(enrichment *agentgateway.AIPromptEnrichment) *api.BackendPolicySpec_Ai_PromptEnrichment {
@@ -119,23 +155,23 @@ func processWebhook(ctx PolicyCtx, namespace string, webhook *agentgateway.Webho
 		return nil, nil
 	}
 
+	var errs []error
 	be, err := BuildBackendRef(ctx, webhook.BackendRef, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build webhook: %v", err)
+		errs = append(errs, fmt.Errorf("failed to build webhook: %v", err))
+		// A nil backend translates to an invalid target, preserving failureMode.
+		be = nil
 	}
 
 	w := &api.BackendPolicySpec_Ai_Webhook{
 		Backend:     be,
-		FailureMode: webhookFailureMode(webhook.FailureMode),
+		FailureMode: guardrailFailureMode(webhook.FailureMode),
+		Action:      mapRejectAuditAction(webhook.Action),
 	}
 
-	var errs []error
 	w.Headers = castCELMap(webhook.Headers, func(key string, expr agentgateway.CELExpression) {
 		errs = append(errs, fmt.Errorf("webhook header %q is not a valid CEL expression: %s", key, expr))
 	})
-	if err := errors.Join(errs...); err != nil {
-		return nil, err
-	}
 
 	if len(webhook.ForwardHeaderMatches) > 0 {
 		headers := make([]*api.HeaderMatch, 0, len(webhook.ForwardHeaderMatches))
@@ -157,10 +193,10 @@ func processWebhook(ctx PolicyCtx, namespace string, webhook *agentgateway.Webho
 		w.ForwardHeaderMatches = headers
 	}
 
-	return w, nil
+	return w, errors.Join(errs...)
 }
 
-func webhookFailureMode(mode agentgateway.FailureMode) api.BackendPolicySpec_Ai_Webhook_FailureMode {
+func guardrailFailureMode(mode agentgateway.FailureMode) api.BackendPolicySpec_Ai_Webhook_FailureMode {
 	if mode == agentgateway.FailOpen {
 		return api.BackendPolicySpec_Ai_Webhook_FAIL_OPEN
 	}
@@ -203,18 +239,27 @@ func processRegexRule(pattern string) *api.BackendPolicySpec_Ai_RegexRule {
 	}
 }
 
+func mapRejectAuditAction(action *agentgateway.RejectAuditAction) api.BackendPolicySpec_Ai_RejectAuditAction {
+	if action != nil && *action == agentgateway.RejectAuditAudit {
+		return api.BackendPolicySpec_Ai_REJECT_AUDIT_ACTION_AUDIT
+	}
+	return api.BackendPolicySpec_Ai_REJECT_AUDIT_ACTION_REJECT
+}
+
 func processRegex(regex *agentgateway.Regex) *api.BackendPolicySpec_Ai_RegexRules {
 	if regex == nil {
 		return nil
 	}
 
-	rules := &api.BackendPolicySpec_Ai_RegexRules{}
+	rules := &api.BackendPolicySpec_Ai_RegexRules{Action: api.BackendPolicySpec_Ai_MASK}
 	if regex.Action != nil {
 		switch *regex.Action {
 		case agentgateway.MASK:
 			rules.Action = api.BackendPolicySpec_Ai_MASK
 		case agentgateway.REJECT:
 			rules.Action = api.BackendPolicySpec_Ai_REJECT
+		case agentgateway.AUDIT:
+			rules.Action = api.BackendPolicySpec_Ai_AUDIT
 		default:
 			logger.Warn("unsupported regex action", "action", *regex.Action)
 		}
@@ -231,57 +276,59 @@ func processRegex(regex *agentgateway.Regex) *api.BackendPolicySpec_Ai_RegexRule
 	return rules
 }
 
-func processModeration(ctx PolicyCtx, namespace string, moderation *agentgateway.OpenAIModeration) *api.BackendPolicySpec_Ai_Moderation {
+func processModeration(ctx PolicyCtx, namespace string, moderation *agentgateway.OpenAIModeration, policies *agentgateway.PromptGuardPolicy) *api.BackendPolicySpec_Ai_Moderation {
 	if moderation == nil {
 		return nil
 	}
 
 	pgModeration := &api.BackendPolicySpec_Ai_Moderation{}
 	pgModeration.Model = moderation.Model
+	pgModeration.Action = mapRejectAuditAction(moderation.Action)
+	pgModeration.FailureMode = guardrailFailureMode(moderation.FailureMode)
 
-	if moderation.Policies != nil {
-		pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, moderation.Policies)
-		if err != nil {
-			logger.Warn("failed to translate policy", "err", err)
-		} else {
-			pgModeration.InlinePolicies = pols
-		}
+	pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, guardPolicies(policies, moderation.Policies))
+	if err != nil {
+		logger.Warn("failed to translate policy", "err", err)
+	} else {
+		pgModeration.InlinePolicies = pols
 	}
 
 	return pgModeration
 }
 
-func processBedrockGuardrails(ctx PolicyCtx, namespace string, guardrails *agentgateway.BedrockGuardrails) *api.BackendPolicySpec_Ai_BedrockGuardrails {
+func processBedrockGuardrails(ctx PolicyCtx, namespace string, guardrails *agentgateway.BedrockGuardrails, policies *agentgateway.PromptGuardPolicy) *api.BackendPolicySpec_Ai_BedrockGuardrails {
 	if guardrails == nil {
 		return nil
 	}
 
 	pgGuardrails := &api.BackendPolicySpec_Ai_BedrockGuardrails{
-		Identifier: guardrails.GuardrailIdentifier,
-		Version:    guardrails.GuardrailVersion,
-		Region:     guardrails.Region,
+		Identifier:  guardrails.GuardrailIdentifier,
+		Version:     guardrails.GuardrailVersion,
+		Region:      guardrails.Region,
+		Action:      mapRejectAuditAction(guardrails.Action),
+		FailureMode: guardrailFailureMode(guardrails.FailureMode),
 	}
 
-	if guardrails.Policies != nil {
-		pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, guardrails.Policies)
-		if err != nil {
-			logger.Warn("failed to translate policy", "err", err)
-		} else {
-			pgGuardrails.InlinePolicies = pols
-		}
+	pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, guardPolicies(policies, guardrails.Policies))
+	if err != nil {
+		logger.Warn("failed to translate policy", "err", err)
+	} else {
+		pgGuardrails.InlinePolicies = pols
 	}
 
 	return pgGuardrails
 }
 
-func processGoogleModelArmor(ctx PolicyCtx, namespace string, armor *agentgateway.GoogleModelArmor) *api.BackendPolicySpec_Ai_GoogleModelArmor {
+func processGoogleModelArmor(ctx PolicyCtx, namespace string, armor *agentgateway.GoogleModelArmor, policies *agentgateway.PromptGuardPolicy) *api.BackendPolicySpec_Ai_GoogleModelArmor {
 	if armor == nil {
 		return nil
 	}
 
 	pgArmor := &api.BackendPolicySpec_Ai_GoogleModelArmor{
-		TemplateId: armor.TemplateID,
-		ProjectId:  armor.ProjectID,
+		TemplateId:  armor.TemplateID,
+		ProjectId:   armor.ProjectID,
+		Action:      mapRejectAuditAction(armor.Action),
+		FailureMode: guardrailFailureMode(armor.FailureMode),
 	}
 
 	// Set location with default value if not specified
@@ -291,13 +338,11 @@ func processGoogleModelArmor(ctx PolicyCtx, namespace string, armor *agentgatewa
 		pgArmor.Location = new("us-central1")
 	}
 
-	if armor.Policies != nil {
-		pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, armor.Policies)
-		if err != nil {
-			logger.Warn("failed to translate policy", "err", err)
-		} else {
-			pgArmor.InlinePolicies = pols
-		}
+	pols, err := translateAuxiliaryBackendPolicies(ctx, namespace, guardPolicies(policies, armor.Policies))
+	if err != nil {
+		logger.Warn("failed to translate policy", "err", err)
+	} else {
+		pgArmor.InlinePolicies = pols
 	}
 
 	return pgArmor
@@ -305,6 +350,14 @@ func processGoogleModelArmor(ctx PolicyCtx, namespace string, armor *agentgatewa
 
 type backendSimplePolicy interface {
 	BackendSimple() *agentgateway.BackendSimple
+}
+
+// guardPolicies prefers guard-level policies over the deprecated provider-level policies.
+func guardPolicies(guardLevel *agentgateway.PromptGuardPolicy, deprecated backendSimplePolicy) backendSimplePolicy {
+	if guardLevel != nil {
+		return guardLevel
+	}
+	return deprecated
 }
 
 func translateAuxiliaryBackendPolicies(ctx PolicyCtx, namespace string, policies backendSimplePolicy) ([]*api.BackendPolicySpec, error) {

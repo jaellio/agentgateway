@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ::cel::extractors::{Argument, This};
-use ::cel::objects::{Key, MapValue, StringValue, ValueType};
+use ::cel::objects::{Key, KeyRef, ListValue, MapValue, StringValue, ValueType};
 use ::cel::{Context, FunctionContext, ResolveResult, Value};
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
@@ -29,11 +29,13 @@ pub fn insert_all(ctx: &mut Context) {
 	ctx.add_function("mapValues", map_values);
 	ctx.add_function("filterKeys", filter_keys);
 	ctx.add_function("merge", map_merge);
+	ctx.add_function("recurse", recurse);
 	ctx.add_function("variables", variables);
 	ctx.add_function("random", random);
 	ctx.add_function("default", default);
 	ctx.add_function("coalesce", coalesce);
 	ctx.add_function("regexReplace", regex_replace);
+	ctx.add_function("regexReplaceAll", regex_replace_all);
 	ctx.add_function("fail", fail);
 	ctx.add_function("uuid", uuid_generate);
 
@@ -160,15 +162,15 @@ pub fn form_decode<'a>(ftx: &mut FunctionContext<'a, '_>, v: Argument) -> Resolv
 	let v = v.load(ftx)?.always_materialize_owned();
 	let bytes = v.as_bytes_pre_materialized()?;
 	let pairs = form_urlencoded::parse(bytes);
-	let mut map = hashbrown::HashMap::<Key, Value<'static>>::new();
+	let mut map = cel::types::map::IndexMap::<Key, Value<'static>>::default();
 	for (key, value) in pairs {
 		let key = Key::from(key.into_owned());
 		let value = Value::from(value.into_owned());
 		match map.entry(key) {
-			hashbrown::hash_map::Entry::Vacant(entry) => {
+			indexmap::map::Entry::Vacant(entry) => {
 				entry.insert(value);
 			},
-			hashbrown::hash_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+			indexmap::map::Entry::Occupied(mut entry) => match entry.get_mut() {
 				Value::List(values) => {
 					let mut values = values.as_ref().to_vec();
 					values.push(value);
@@ -320,6 +322,40 @@ fn must_map(v: Value) -> Result<MapValue, cel::ExecutionError> {
 	}
 }
 
+/// Returns the receiver followed by each map reached by repeatedly following `field`.
+fn recurse<'a>(
+	ftx: &mut FunctionContext<'a, '_>,
+	this: This,
+	field: Argument,
+) -> ResolveResult<'a> {
+	let mut current: Value<'a> = this.load_unmaterialized(ftx)?;
+	let field: StringValue = field.load_value(ftx)?;
+	let key = KeyRef::String(field.clone());
+	let mut chain: Vec<Value<'a>> = Vec::new();
+	loop {
+		let next = match &current {
+			Value::Map(m) => m.get(&key).cloned(),
+			// Materialize only the last dynamic node, to check it is a map.
+			Value::Dynamic(d) => match d.field(field.as_ref()) {
+				Some(v) => Some(v),
+				None if matches!(d.materialize(), Value::Map(_)) => None,
+				None => return Err(not_map(&current)),
+			},
+			_ => return Err(not_map(&current)),
+		};
+		chain.push(current);
+		match next {
+			Some(v) => current = v,
+			None => break,
+		}
+	}
+	Ok(Value::List(ListValue::PartiallyOwned(chain.into())))
+}
+
+fn not_map(v: &Value) -> cel::ExecutionError {
+	v.always_materialize().error_expected_type(ValueType::Map)
+}
+
 fn fail<'a>(ftx: &mut FunctionContext<'a, '_>, v: Argument) -> ResolveResult<'a> {
 	let v: StringValue = v.load_value(ftx)?;
 	Err(ftx.error(format!("fail() called: {}", v.as_ref())))
@@ -377,6 +413,25 @@ pub fn regex_replace<'a>(
 	match regex::Regex::new(regex.as_ref()) {
 		Ok(re) => Ok(
 			re.replace(this.as_ref(), replacement.as_ref())
+				.to_string()
+				.into(),
+		),
+		Err(err) => Err(ftx.error(format!("'{}' not a valid regex:\n{err}", regex.as_ref()))),
+	}
+}
+
+pub fn regex_replace_all<'a>(
+	ftx: &mut FunctionContext<'a, '_>,
+	this: This,
+	regex: Argument,
+	replacement: Argument,
+) -> ResolveResult<'a> {
+	let this: StringValue = this.load_value(ftx)?;
+	let regex: StringValue = regex.load_value(ftx)?;
+	let replacement: StringValue = replacement.load_value(ftx)?;
+	match regex::Regex::new(regex.as_ref()) {
+		Ok(re) => Ok(
+			re.replace_all(this.as_ref(), replacement.as_ref())
 				.to_string()
 				.into(),
 		),

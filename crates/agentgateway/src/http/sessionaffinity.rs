@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
-use twox_hash::XxHash3_64;
-
 use crate::cel::{Executor, Expression};
+use crate::types::loadbalancer::hash_affinity_key;
 use crate::*;
 
-/// Pins requests that carry the same affinity value to the same healthy service endpoint.
+/// Configures best-effort session affinity using an existing request attribute.
 ///
-/// This policy is intentionally stateless. Every gateway replica computes the same rendezvous
-/// hash from the request affinity value and the currently available endpoint set.
+/// The source CEL expression selects the affinity value. Requests with the same value are
+/// consistently load balanced to the same healthy service endpoint or AI provider. Unlike session
+/// persistence, this policy does not identify or track a previously selected backend, so changes to
+/// the available backends may remap a value.
 #[apply(schema!)]
 #[cfg_attr(feature = "schema", schemars(rename = "SessionAffinityPolicy"))]
 pub struct Policy {
@@ -55,7 +56,7 @@ impl Policy {
 			return None;
 		}
 
-		Some(XxHash3_64::oneshot(bytes))
+		Some(hash_affinity_key(bytes))
 	}
 
 	pub fn register_expressions(&self, ctx: &mut crate::cel::ContextBuilder) {
@@ -97,7 +98,7 @@ mod tests {
 
 	#[test]
 	fn policy_deserializes_cel_source() {
-		let policy: Policy = serde_yaml::from_str(
+		let policy: Policy = serde_norway::from_str(
 			r#"
 source: request.headers["x-session-id"]
 "#,

@@ -17,7 +17,7 @@ use common::ast::SelectExpr;
 pub use context::Context;
 pub use functions::FunctionContext;
 pub use objects::{ResolveResult, Value};
-use parser::{Expression, ExpressionReferences, Parser};
+use parser::{CallSignature, Expression, ExpressionReferences, Parser};
 pub use parser::{ParseError, ParseErrors};
 pub mod functions;
 mod magic;
@@ -181,17 +181,6 @@ impl ExecutionError {
 		}
 	}
 
-	pub fn unsupported_target_type(target: Value<'static>) -> Self {
-		ExecutionError::UnsupportedTargetType { target }
-	}
-
-	pub fn not_supported_as_method(method: &str, target: Value<'static>) -> Self {
-		ExecutionError::NotSupportedAsMethod {
-			method: method.to_string(),
-			target,
-		}
-	}
-
 	pub fn unsupported_key_type(value: Value<'static>) -> Self {
 		ExecutionError::UnsupportedKeyType(value)
 	}
@@ -259,6 +248,25 @@ impl Program {
 	/// ```
 	pub fn references(&self) -> ExpressionReferences<'_> {
 		self.expression.references()
+	}
+
+	/// Returns every function call site in the program with its call arity.
+	///
+	/// Unlike [`Program::references`], which dedupes by name, this reports one
+	/// entry per call so that arity can be checked at each site.
+	///
+	/// # Example
+	/// ```rust
+	/// # use cel::Program;
+	/// let program = Program::compile("'ab'.contains('a')").unwrap();
+	/// let calls = program.call_signatures();
+	///
+	/// let contains = calls.iter().find(|c| c.name == "contains").unwrap();
+	/// assert_eq!(contains.arity, 2);
+	/// assert!(contains.method_style);
+	/// ```
+	pub fn call_signatures(&self) -> Vec<CallSignature<'_>> {
+		self.expression.call_signatures()
 	}
 
 	/// Returns the contained expression

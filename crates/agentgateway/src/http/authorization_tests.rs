@@ -193,7 +193,10 @@ fn test_network_authorization_allows_source_cidr() {
 		connect_headers: http::HeaderMap::new(),
 	};
 
-	assert_matches!(network_authz.apply(&source), Ok(()));
+	assert_matches!(
+		network_authz.apply(&cel::Executor::new_source(&source)),
+		Ok(())
+	);
 }
 
 #[test]
@@ -215,7 +218,10 @@ fn test_network_authorization_deny_takes_precedence() {
 		connect_headers: http::HeaderMap::new(),
 	};
 
-	assert_matches!(network_authz.apply(&source), Err(_));
+	assert_matches!(
+		network_authz.apply(&cel::Executor::new_source(&source)),
+		Err(_)
+	);
 }
 
 #[test]
@@ -368,6 +374,44 @@ fn test_require_is_not_sufficient_when_allow_rules_exist() {
 	let mcp = tool_context("server", "increment");
 	let exec = cel::Executor::new_mcp(admin_req.as_ref(), &mcp);
 	assert_matches!(rs.validate(&exec), true);
+}
+
+#[test]
+fn test_require_act_chain_denies_bad_deep_actor_despite_allow() {
+	let require_act_chain = RuleSet::new(create_require_policy_set(vec![
+		r#"has(jwt.act) && jwt.act.recurse("act").all(a, a.sub in ["agent-a", "agent-b"])"#,
+	]));
+	let allow_user = RuleSet::new(create_policy_set(vec![r#"jwt.sub == "user""#]));
+	let mut ctx = ContextBuilder::new();
+	let rs = RuleSets::from(vec![require_act_chain, allow_user]);
+	rs.register(&mut ctx);
+	let mcp = tool_context("server", "increment");
+
+	let allowed = req(json!({
+		"sub": "user",
+		"act": {"sub": "agent-a", "act": {"sub": "agent-b"}},
+	}));
+	let exec = cel::Executor::new_mcp(allowed.as_ref(), &mcp);
+	assert_matches!(rs.validate(&exec), true);
+
+	let bad_deep_actor = req(json!({
+		"sub": "user",
+		"act": {"sub": "agent-a", "act": {"sub": "agent-b", "act": {"sub": "rogue"}}},
+	}));
+	let exec = cel::Executor::new_mcp(bad_deep_actor.as_ref(), &mcp);
+	assert_matches!(rs.validate(&exec), false);
+
+	let malformed = req(json!({"sub": "user", "act": "agent-a"}));
+	let exec = cel::Executor::new_mcp(malformed.as_ref(), &mcp);
+	assert_matches!(rs.validate(&exec), false);
+
+	let no_delegation = req(json!({"sub": "user"}));
+	let exec = cel::Executor::new_mcp(no_delegation.as_ref(), &mcp);
+	assert_matches!(rs.validate(&exec), false);
+
+	let empty_actor = req(json!({"sub": "user", "act": {}}));
+	let exec = cel::Executor::new_mcp(empty_actor.as_ref(), &mcp);
+	assert_matches!(rs.validate(&exec), false);
 }
 
 #[divan::bench]
